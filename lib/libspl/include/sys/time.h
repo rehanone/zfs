@@ -25,30 +25,60 @@
  */
 
 #ifndef _LIBSPL_SYS_TIME_H
-#define _LIBSPL_SYS_TIME_H
+#define	_LIBSPL_SYS_TIME_H
 
 #include_next <sys/time.h>
 #include <sys/types.h>
 
 #ifndef SEC
-#define SEC		1
+#define	SEC		1
 #endif
 
 #ifndef MILLISEC
-#define MILLISEC	1000
+#define	MILLISEC	1000
 #endif
 
 #ifndef MICROSEC
-#define MICROSEC	1000000
+#define	MICROSEC	1000000
 #endif
 
 #ifndef NANOSEC
-#define NANOSEC		1000000000
+#define	NANOSEC		1000000000
 #endif
 
 #ifndef NSEC_PER_USEC
-#define NSEC_PER_USEC	1000L
+#define	NSEC_PER_USEC	1000L
 #endif
+
+#ifndef MSEC2NSEC
+#define	MSEC2NSEC(m)	((hrtime_t)(m) * (NANOSEC / MILLISEC))
+#endif
+
+#ifndef NSEC2MSEC
+#define	NSEC2MSEC(n)	((n) / (NANOSEC / MILLISEC))
+#endif
+
+#ifndef USEC2NSEC
+#define	USEC2NSEC(m)	((hrtime_t)(m) * (NANOSEC / MICROSEC))
+#endif
+
+#ifndef NSEC2USEC
+#define	NSEC2USEC(n)	((n) / (NANOSEC / MICROSEC))
+#endif
+
+#ifndef NSEC2SEC
+#define	NSEC2SEC(n)	((n) / (NANOSEC / SEC))
+#endif
+
+#ifndef SEC2NSEC
+#define	SEC2NSEC(m)	((hrtime_t)(m) * (NANOSEC / SEC))
+#endif
+
+
+typedef	long long		hrtime_t;
+typedef	struct	timespec	timestruc_t;
+typedef	struct	timespec	timespec_t;
+
 
 extern hrtime_t gethrtime(void);
 extern void gethrestime(timestruc_t *);

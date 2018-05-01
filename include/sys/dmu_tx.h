@@ -22,6 +22,9 @@
  * Copyright 2010 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
  */
+/*
+ * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+ */
 
 #ifndef	_SYS_DMU_TX_H
 #define	_SYS_DMU_TX_H
@@ -57,17 +60,26 @@ struct dmu_tx {
 	txg_handle_t tx_txgh;
 	void *tx_tempreserve_cookie;
 	struct dmu_tx_hold *tx_needassign_txh;
-	list_t tx_callbacks; /* list of dmu_tx_callback_t on this dmu_tx */
-	uint8_t tx_anyobj;
+
+	/* list of dmu_tx_callback_t on this dmu_tx */
+	list_t tx_callbacks;
+
+	/* placeholder for syncing context, doesn't need specific holds */
+	boolean_t tx_anyobj;
+
+	/* transaction is marked as being a "net free" of space */
+	boolean_t tx_netfree;
+
+	/* time this transaction was created */
+	hrtime_t tx_start;
+
+	/* need to wait for sufficient dirty space */
+	boolean_t tx_wait_dirty;
+
+	/* has this transaction already been delayed? */
+	boolean_t tx_dirty_delayed;
+
 	int tx_err;
-#ifdef DEBUG_DMU_TX
-	uint64_t tx_space_towrite;
-	uint64_t tx_space_tofree;
-	uint64_t tx_space_tooverwrite;
-	uint64_t tx_space_tounref;
-	refcount_t tx_space_written;
-	refcount_t tx_space_freed;
-#endif
 };
 
 enum dmu_tx_hold_type {
@@ -85,17 +97,11 @@ typedef struct dmu_tx_hold {
 	dmu_tx_t *txh_tx;
 	list_node_t txh_node;
 	struct dnode *txh_dnode;
-	uint64_t txh_space_towrite;
-	uint64_t txh_space_tofree;
-	uint64_t txh_space_tooverwrite;
-	uint64_t txh_space_tounref;
-	uint64_t txh_memory_tohold;
-	uint64_t txh_fudge;
-#ifdef DEBUG_DMU_TX
+	refcount_t txh_space_towrite;
+	refcount_t txh_memory_tohold;
 	enum dmu_tx_hold_type txh_type;
 	uint64_t txh_arg1;
 	uint64_t txh_arg2;
-#endif
 } dmu_tx_hold_t;
 
 typedef struct dmu_tx_callback {
@@ -113,20 +119,19 @@ typedef struct dmu_tx_stats {
 	kstat_named_t dmu_tx_error;
 	kstat_named_t dmu_tx_suspended;
 	kstat_named_t dmu_tx_group;
-	kstat_named_t dmu_tx_how;
 	kstat_named_t dmu_tx_memory_reserve;
 	kstat_named_t dmu_tx_memory_reclaim;
-	kstat_named_t dmu_tx_memory_inflight;
 	kstat_named_t dmu_tx_dirty_throttle;
-	kstat_named_t dmu_tx_write_limit;
+	kstat_named_t dmu_tx_dirty_delay;
+	kstat_named_t dmu_tx_dirty_over_max;
 	kstat_named_t dmu_tx_quota;
 } dmu_tx_stats_t;
 
 extern dmu_tx_stats_t dmu_tx_stats;
 
-#define DMU_TX_STAT_INCR(stat, val) \
+#define	DMU_TX_STAT_INCR(stat, val) \
     atomic_add_64(&dmu_tx_stats.stat.value.ui64, (val));
-#define DMU_TX_STAT_BUMP(stat) \
+#define	DMU_TX_STAT_BUMP(stat) \
     DMU_TX_STAT_INCR(stat, 1);
 
 /*
@@ -137,11 +142,8 @@ int dmu_tx_assign(dmu_tx_t *tx, uint64_t txg_how);
 void dmu_tx_commit(dmu_tx_t *tx);
 void dmu_tx_abort(dmu_tx_t *tx);
 uint64_t dmu_tx_get_txg(dmu_tx_t *tx);
+struct dsl_pool *dmu_tx_pool(dmu_tx_t *tx);
 void dmu_tx_wait(dmu_tx_t *tx);
-
-void dmu_tx_callback_register(dmu_tx_t *tx, dmu_tx_callback_func_t *dcb_func,
-    void *dcb_data);
-void dmu_tx_do_callbacks(list_t *cb_list, int error);
 
 /*
  * These routines are defined in dmu_spa.h, and are called by the SPA.
@@ -154,13 +156,11 @@ extern dmu_tx_t *dmu_tx_create_assigned(struct dsl_pool *dp, uint64_t txg);
 dmu_tx_t *dmu_tx_create_dd(dsl_dir_t *dd);
 int dmu_tx_is_syncing(dmu_tx_t *tx);
 int dmu_tx_private_ok(dmu_tx_t *tx);
-void dmu_tx_add_new_object(dmu_tx_t *tx, objset_t *os, uint64_t object);
-void dmu_tx_willuse_space(dmu_tx_t *tx, int64_t delta);
+void dmu_tx_add_new_object(dmu_tx_t *tx, dnode_t *dn);
 void dmu_tx_dirty_buf(dmu_tx_t *tx, struct dmu_buf_impl *db);
-int dmu_tx_holds(dmu_tx_t *tx, uint64_t object);
 void dmu_tx_hold_space(dmu_tx_t *tx, uint64_t space);
 
-#ifdef DEBUG_DMU_TX
+#ifdef ZFS_DEBUG
 #define	DMU_TX_DIRTY_BUF(tx, db)	dmu_tx_dirty_buf(tx, db)
 #else
 #define	DMU_TX_DIRTY_BUF(tx, db)

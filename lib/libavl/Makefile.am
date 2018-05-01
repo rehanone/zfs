@@ -1,6 +1,9 @@
 include $(top_srcdir)/config/Rules.am
 
-AM_CFLAGS += $(DEBUG_STACKFLAGS) $(FRAME_LARGER_THAN)
+VPATH = $(top_srcdir)/module/avl/
+
+# Includes kernel code, generate warnings for large stack frames
+AM_CFLAGS += $(FRAME_LARGER_THAN)
 
 DEFAULT_INCLUDES += \
 	-I$(top_srcdir)/include \
@@ -8,5 +11,13 @@ DEFAULT_INCLUDES += \
 
 noinst_LTLIBRARIES = libavl.la
 
-libavl_la_SOURCES = \
-	$(top_srcdir)/module/avl/avl.c
+USER_C =
+
+KERNEL_C = \
+	avl.c
+
+nodist_libavl_la_SOURCES = \
+	$(USER_C) \
+	$(KERNEL_C)
+
+EXTRA_DIST = $(USER_C)

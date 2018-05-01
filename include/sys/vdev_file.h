@@ -27,8 +27,6 @@
 #ifndef _SYS_VDEV_FILE_H
 #define	_SYS_VDEV_FILE_H
 
-
-
 #include <sys/vdev.h>
 
 #ifdef	__cplusplus
@@ -38,6 +36,9 @@ extern "C" {
 typedef struct vdev_file {
 	vnode_t		*vf_vnode;
 } vdev_file_t;
+
+extern void vdev_file_init(void);
+extern void vdev_file_fini(void);
 
 #ifdef	__cplusplus
 }

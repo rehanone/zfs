@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -32,10 +32,15 @@
 #include <sys/spa.h>
 #include <sys/zio.h>
 #include <sys/dmu.h>
+#include <sys/zio_crypt.h>
 
 #ifdef	__cplusplus
 extern "C" {
 #endif
+
+struct dsl_pool;
+struct dsl_dataset;
+struct lwb;
 
 /*
  * Intent log format:
@@ -90,7 +95,15 @@ typedef struct zil_chain {
 } zil_chain_t;
 
 #define	ZIL_MIN_BLKSZ	4096ULL
-#define	ZIL_MAX_BLKSZ	SPA_MAXBLOCKSIZE
+
+/*
+ * ziltest is by and large an ugly hack, but very useful in
+ * checking replay without tedious work.
+ * When running ziltest we want to keep all itx's and so maintain
+ * a single list in the zl_itxg[] that uses a high txg: ZILTEST_TXG
+ * We subtract TXG_CONCURRENT_STATES to allow for common code.
+ */
+#define	ZILTEST_TXG (UINT64_MAX - TXG_CONCURRENT_STATES)
 
 /*
  * The words of a log block checksum.
@@ -128,6 +141,7 @@ typedef enum zil_create {
 /*
  * Intent log transaction types and record structures
  */
+#define	TX_COMMIT		0	/* Commit marker (no on-disk state) */
 #define	TX_CREATE		1	/* Create file */
 #define	TX_MKDIR		2	/* Make directory */
 #define	TX_MKXATTR		3	/* Make XATTR directory */
@@ -169,6 +183,19 @@ typedef enum zil_create {
 	(txtype) == TX_ACL_V0 ||	\
 	(txtype) == TX_ACL ||		\
 	(txtype) == TX_WRITE2)
+
+/*
+ * The number of dnode slots consumed by the object is stored in the 8
+ * unused upper bits of the object ID. We subtract 1 from the value
+ * stored on disk for compatibility with implementations that don't
+ * support large dnodes. The slot count for a single-slot dnode will
+ * contain 0 for those bits to preserve the log record format for
+ * "small" dnodes.
+ */
+#define	LR_FOID_GET_SLOTS(oid) (BF64_GET((oid), 56, 8) + 1)
+#define	LR_FOID_SET_SLOTS(oid, x) BF64_SET((oid), 56, 8, (x) - 1)
+#define	LR_FOID_GET_OBJ(oid) BF64_GET((oid), 0, DN_MAX_OBJECT_SHIFT)
+#define	LR_FOID_SET_OBJ(oid, x) BF64_SET((oid), 0, DN_MAX_OBJECT_SHIFT, (x))
 
 /*
  * Format of log records.
@@ -242,6 +269,12 @@ typedef struct {
  * information needed for replaying the create.  If the
  * file doesn't have any actual ACEs then the lr_aclcnt
  * would be zero.
+ *
+ * After lr_acl_flags, there are a lr_acl_bytes number of variable sized ace's.
+ * If create is also setting xvattr's, then acl data follows xvattr.
+ * If ACE FUIDs are needed then they will follow the xvattr_t.  Following
+ * the FUIDs will be the domain table information.  The FUIDs for the owner
+ * and group will be in lr_create.  Name follows ACL data.
  */
 typedef struct {
 	lr_create_t	lr_create;	/* common create portion */
@@ -250,13 +283,6 @@ typedef struct {
 	uint64_t	lr_fuidcnt;	/* number of real fuids */
 	uint64_t	lr_acl_bytes;	/* number of bytes in ACL */
 	uint64_t	lr_acl_flags;	/* ACL flags */
-	/* lr_acl_bytes number of variable sized ace's follows */
-	/* if create is also setting xvattr's, then acl data follows xvattr */
-	/* if ACE FUIDs are needed then they will follow the xvattr_t */
-	/* Following the FUIDs will be the domain table information. */
-	/* The FUIDs for the owner and group will be in the lr_create */
-	/* portion of the record. */
-	/* name follows ACL data */
 } lr_acl_create_t;
 
 typedef struct {
@@ -347,7 +373,7 @@ typedef struct {
  *	- the write occupies only one block
  * WR_COPIED:
  *    If we know we'll immediately be committing the
- *    transaction (FSYNC or FDSYNC), the we allocate a larger
+ *    transaction (FSYNC or FDSYNC), then we allocate a larger
  *    log record here for the data and copy the data in.
  * WR_NEED_COPY:
  *    Otherwise we don't allocate a buffer, and *if* we need to
@@ -362,12 +388,16 @@ typedef enum {
 	WR_NUM_STATES	/* number of states */
 } itx_wr_state_t;
 
+typedef void (*zil_callback_t)(void *data);
+
 typedef struct itx {
 	list_node_t	itx_node;	/* linkage on zl_itx_list */
 	void		*itx_private;	/* type-specific opaque data */
 	itx_wr_state_t	itx_wr_state;	/* write state */
 	uint8_t		itx_sync;	/* synchronous transaction */
-	uint64_t	itx_sod;	/* record size on disk */
+	zil_callback_t	itx_callback;   /* Called when the itx is persistent */
+	void		*itx_callback_data; /* User data for the callback */
+	size_t		itx_size;	/* allocated itx structure size */
 	uint64_t	itx_oid;	/* object id */
 	lr_t		itx_lr;		/* common part of log record */
 	/* followed by type-specific part of lr_xx_t and its immediate data */
@@ -427,20 +457,22 @@ typedef struct zil_stats {
 
 extern zil_stats_t zil_stats;
 
-#define ZIL_STAT_INCR(stat, val) \
+#define	ZIL_STAT_INCR(stat, val) \
     atomic_add_64(&zil_stats.stat.value.ui64, (val));
-#define ZIL_STAT_BUMP(stat) \
+#define	ZIL_STAT_BUMP(stat) \
     ZIL_STAT_INCR(stat, 1);
 
 typedef int zil_parse_blk_func_t(zilog_t *zilog, blkptr_t *bp, void *arg,
     uint64_t txg);
 typedef int zil_parse_lr_func_t(zilog_t *zilog, lr_t *lr, void *arg,
     uint64_t txg);
-typedef int (*const zil_replay_func_t)(void *, char *, boolean_t);
-typedef int zil_get_data_t(void *arg, lr_write_t *lr, char *dbuf, zio_t *zio);
+typedef int zil_replay_func_t(void *arg1, void *arg2, boolean_t byteswap);
+typedef int zil_get_data_t(void *arg, lr_write_t *lr, char *dbuf,
+    struct lwb *lwb, zio_t *zio);
 
 extern int zil_parse(zilog_t *zilog, zil_parse_blk_func_t *parse_blk_func,
-    zil_parse_lr_func_t *parse_lr_func, void *arg, uint64_t txg);
+    zil_parse_lr_func_t *parse_lr_func, void *arg, uint64_t txg,
+    boolean_t decrypt);
 
 extern void	zil_init(void);
 extern void	zil_fini(void);
@@ -452,28 +484,31 @@ extern zilog_t	*zil_open(objset_t *os, zil_get_data_t *get_data);
 extern void	zil_close(zilog_t *zilog);
 
 extern void	zil_replay(objset_t *os, void *arg,
-    zil_replay_func_t replay_func[TX_MAX_TYPE]);
+    zil_replay_func_t *replay_func[TX_MAX_TYPE]);
 extern boolean_t zil_replaying(zilog_t *zilog, dmu_tx_t *tx);
 extern void	zil_destroy(zilog_t *zilog, boolean_t keep_first);
 extern void	zil_destroy_sync(zilog_t *zilog, dmu_tx_t *tx);
-extern void	zil_rollback_destroy(zilog_t *zilog, dmu_tx_t *tx);
 
 extern itx_t	*zil_itx_create(uint64_t txtype, size_t lrsize);
 extern void	zil_itx_destroy(itx_t *itx);
 extern void	zil_itx_assign(zilog_t *zilog, itx_t *itx, dmu_tx_t *tx);
 
 extern void	zil_commit(zilog_t *zilog, uint64_t oid);
+extern void	zil_commit_impl(zilog_t *zilog, uint64_t oid);
 
-extern int	zil_vdev_offline(const char *osname, void *txarg);
-extern int	zil_claim(const char *osname, void *txarg);
-extern int	zil_check_log_chain(const char *osname, void *txarg);
+extern int	zil_reset(const char *osname, void *txarg);
+extern int	zil_claim(struct dsl_pool *dp,
+    struct dsl_dataset *ds, void *txarg);
+extern int 	zil_check_log_chain(struct dsl_pool *dp,
+    struct dsl_dataset *ds, void *tx);
 extern void	zil_sync(zilog_t *zilog, dmu_tx_t *tx);
 extern void	zil_clean(zilog_t *zilog, uint64_t synced_txg);
 
-extern int	zil_suspend(zilog_t *zilog);
-extern void	zil_resume(zilog_t *zilog);
+extern int	zil_suspend(const char *osname, void **cookiep);
+extern void	zil_resume(void *cookie);
 
-extern void	zil_add_block(zilog_t *zilog, const blkptr_t *bp);
+extern void	zil_lwb_add_block(struct lwb *lwb, const blkptr_t *bp);
+extern void	zil_lwb_add_txg(struct lwb *lwb, uint64_t txg);
 extern int	zil_bp_tree_add(zilog_t *zilog, const blkptr_t *bp);
 
 extern void	zil_set_sync(zilog_t *zilog, uint64_t syncval);

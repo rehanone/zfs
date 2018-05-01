@@ -1,29 +1,68 @@
 include $(top_srcdir)/config/Rules.am
 
+VPATH = \
+	$(top_srcdir)/module/icp \
+	$(top_srcdir)/module/zcommon \
+	$(top_srcdir)/lib/libzfs
+
+# Suppress unused but set variable warnings often due to ASSERTs
+AM_CFLAGS += $(NO_UNUSED_BUT_SET_VARIABLE)
+
+libzfs_pcdir = $(datarootdir)/pkgconfig
+libzfs_pc_DATA = libzfs.pc libzfs_core.pc
+
 DEFAULT_INCLUDES += \
 	-I$(top_srcdir)/include \
+	-I$(top_srcdir)/module/icp/include \
 	-I$(top_srcdir)/lib/libspl/include
 
 lib_LTLIBRARIES = libzfs.la
 
-libzfs_la_SOURCES = \
-	$(top_srcdir)/lib/libzfs/libzfs_changelist.c \
-	$(top_srcdir)/lib/libzfs/libzfs_config.c \
-	$(top_srcdir)/lib/libzfs/libzfs_dataset.c \
-	$(top_srcdir)/lib/libzfs/libzfs_diff.c \
-	$(top_srcdir)/lib/libzfs/libzfs_fru.c \
-	$(top_srcdir)/lib/libzfs/libzfs_graph.c \
-	$(top_srcdir)/lib/libzfs/libzfs_import.c \
-	$(top_srcdir)/lib/libzfs/libzfs_iter.c \
-	$(top_srcdir)/lib/libzfs/libzfs_mount.c \
-	$(top_srcdir)/lib/libzfs/libzfs_pool.c \
-	$(top_srcdir)/lib/libzfs/libzfs_sendrecv.c \
-	$(top_srcdir)/lib/libzfs/libzfs_status.c \
-	$(top_srcdir)/lib/libzfs/libzfs_util.c
+USER_C = \
+	libzfs_changelist.c \
+	libzfs_config.c \
+	libzfs_crypto.c \
+	libzfs_dataset.c \
+	libzfs_diff.c \
+	libzfs_import.c \
+	libzfs_iter.c \
+	libzfs_mount.c \
+	libzfs_pool.c \
+	libzfs_sendrecv.c \
+	libzfs_status.c \
+	libzfs_util.c
+
+KERNEL_C = \
+	algs/sha2/sha2.c \
+	zfeature_common.c \
+	zfs_comutil.c \
+	zfs_deleg.c \
+	zfs_fletcher.c \
+	zfs_fletcher_aarch64_neon.c \
+	zfs_fletcher_avx512.c \
+	zfs_fletcher_intel.c \
+	zfs_fletcher_sse.c \
+	zfs_fletcher_superscalar.c \
+	zfs_fletcher_superscalar4.c \
+	zfs_namecheck.c \
+	zfs_prop.c \
+	zfs_uio.c \
+	zpool_prop.c \
+	zprop_common.c
+
+nodist_libzfs_la_SOURCES = \
+	$(USER_C) \
+	$(KERNEL_C)
 
 libzfs_la_LIBADD = \
-	$(top_builddir)/lib/libshare/libshare.la \
+        $(top_builddir)/lib/libefi/libefi.la \
 	$(top_builddir)/lib/libnvpair/libnvpair.la \
-	$(top_builddir)/lib/libzpool/libzpool.la
+	$(top_builddir)/lib/libshare/libshare.la \
+	$(top_builddir)/lib/libtpool/libtpool.la \
+	$(top_builddir)/lib/libuutil/libuutil.la \
+	$(top_builddir)/lib/libzfs_core/libzfs_core.la
 
-libzfs_la_LDFLAGS = -lm -ldl -version-info 1:1:0 $(LIBSELINUX)
+libzfs_la_LIBADD += -lm $(LIBBLKID) $(LIBUDEV) $(LIBSSL)
+libzfs_la_LDFLAGS = -version-info 2:0:0
+
+EXTRA_DIST = $(libzfs_pc_DATA) $(USER_C)

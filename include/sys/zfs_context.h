@@ -19,13 +19,10 @@
  * CDDL HEADER END
  */
 /*
- * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
- * Use is subject to license terms.
- */
-/*
- * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
+ * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
- * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 #ifndef _SYS_ZFS_CONTEXT_H
@@ -41,6 +38,8 @@
 #include <sys/bitmap.h>
 #include <sys/cmn_err.h>
 #include <sys/kmem.h>
+#include <sys/kmem_cache.h>
+#include <sys/vmem.h>
 #include <sys/taskq.h>
 #include <sys/buf.h>
 #include <sys/param.h>
@@ -59,12 +58,18 @@
 #include <sys/time.h>
 #include <vm/seg_kmem.h>
 #include <sys/zone.h>
+#include <sys/sdt.h>
+#include <sys/kstat.h>
 #include <sys/zfs_debug.h>
-#include <sys/fm/fs/zfs.h>
+#include <sys/sysevent.h>
+#include <sys/sysevent/eventdefs.h>
+#include <sys/zfs_delay.h>
 #include <sys/sunddi.h>
 #include <sys/ctype.h>
 #include <sys/disp.h>
+#include <sys/trace.h>
 #include <linux/dcache_compat.h>
+#include <linux/utsname_compat.h>
 
 #else /* _KERNEL */
 
@@ -88,6 +93,8 @@
 #include <string.h>
 #include <strings.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <synch.h>
 #include <assert.h>
 #include <alloca.h>
 #include <umem.h>
@@ -96,6 +103,8 @@
 #include <dirent.h>
 #include <time.h>
 #include <ctype.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <sys/note.h>
 #include <sys/types.h>
 #include <sys/cred.h>
@@ -109,15 +118,18 @@
 #include <sys/sdt.h>
 #include <sys/kstat.h>
 #include <sys/u8_textprep.h>
-#include <sys/fm/fs/zfs.h>
+#include <sys/sysevent.h>
+#include <sys/sysevent/eventdefs.h>
 #include <sys/sunddi.h>
 #include <sys/debug.h>
+#include <sys/utsname.h>
 
 /*
  * Stack
  */
 
-#define  noinline	__attribute__((noinline))
+#define	noinline	__attribute__((noinline))
+#define	likely(x)	__builtin_expect((x), 1)
 
 /*
  * Debugging
@@ -133,63 +145,86 @@
 #define	CE_PANIC	3	/* panic		*/
 #define	CE_IGNORE	4	/* print nothing	*/
 
-extern int aok;
-
 /*
  * ZFS debugging
  */
 
 extern void dprintf_setup(int *argc, char **argv);
-extern void __dprintf(const char *file, const char *func,
-    int line, const char *fmt, ...);
+
 extern void cmn_err(int, const char *, ...);
-extern void vcmn_err(int, const char *, __va_list);
-extern void panic(const char *, ...);
-extern void vpanic(const char *, __va_list);
+extern void vcmn_err(int, const char *, va_list);
+extern void panic(const char *, ...)  __NORETURN;
+extern void vpanic(const char *, va_list)  __NORETURN;
 
 #define	fm_panic	panic
 
+extern int aok;
+
 /*
  * DTrace SDT probes have different signatures in userland than they do in
- * kernel.  If they're being used in kernel code, re-define them out of
+ * the kernel.  If they're being used in kernel code, re-define them out of
  * existence for their counterparts in libzpool.
+ *
+ * Here's an example of how to use the set-error probes in userland:
+ * zfs$target:::set-error /arg0 == EBUSY/ {stack();}
+ *
+ * Here's an example of how to use DTRACE_PROBE probes in userland:
+ * If there is a probe declared as follows:
+ * DTRACE_PROBE2(zfs__probe_name, uint64_t, blkid, dnode_t *, dn);
+ * Then you can use it as follows:
+ * zfs$target:::probe2 /copyinstr(arg0) == "zfs__probe_name"/
+ *     {printf("%u %p\n", arg1, arg2);}
  */
 
 #ifdef DTRACE_PROBE
 #undef	DTRACE_PROBE
-#define	DTRACE_PROBE(a)	((void)0)
 #endif	/* DTRACE_PROBE */
+#define	DTRACE_PROBE(a) \
+	ZFS_PROBE0(#a)
 
 #ifdef DTRACE_PROBE1
 #undef	DTRACE_PROBE1
-#define	DTRACE_PROBE1(a, b, c)	((void)0)
 #endif	/* DTRACE_PROBE1 */
+#define	DTRACE_PROBE1(a, b, c) \
+	ZFS_PROBE1(#a, (unsigned long)c)
 
 #ifdef DTRACE_PROBE2
 #undef	DTRACE_PROBE2
-#define	DTRACE_PROBE2(a, b, c, d, e)	((void)0)
 #endif	/* DTRACE_PROBE2 */
+#define	DTRACE_PROBE2(a, b, c, d, e) \
+	ZFS_PROBE2(#a, (unsigned long)c, (unsigned long)e)
 
 #ifdef DTRACE_PROBE3
 #undef	DTRACE_PROBE3
-#define	DTRACE_PROBE3(a, b, c, d, e, f, g)	((void)0)
 #endif	/* DTRACE_PROBE3 */
+#define	DTRACE_PROBE3(a, b, c, d, e, f, g) \
+	ZFS_PROBE3(#a, (unsigned long)c, (unsigned long)e, (unsigned long)g)
 
 #ifdef DTRACE_PROBE4
 #undef	DTRACE_PROBE4
-#define	DTRACE_PROBE4(a, b, c, d, e, f, g, h, i)	((void)0)
 #endif	/* DTRACE_PROBE4 */
+#define	DTRACE_PROBE4(a, b, c, d, e, f, g, h, i) \
+	ZFS_PROBE4(#a, (unsigned long)c, (unsigned long)e, (unsigned long)g, \
+	(unsigned long)i)
 
 /*
- * Threads
+ * Threads.
  */
-#define	TS_MAGIC		0x72f158ab4261e538ull
-#define	TS_RUN			0x00000002
-#ifdef __linux__
-#define	STACK_SIZE		8192	/* Linux x86 and amd64 */
-#else
-#define	STACK_SIZE		24576	/* Solaris */
-#endif
+typedef pthread_t	kthread_t;
+
+#define	TS_RUN		0x00000002
+#define	TS_JOINABLE	0x00000004
+
+#define	curthread	((void *)(uintptr_t)pthread_self())
+#define	kpreempt(x)	yield()
+#define	getcomm()	"unknown"
+
+#define	thread_create(stk, stksize, func, arg, len, pp, state, pri)	\
+	zk_thread_create(func, arg, stksize, state)
+#define	thread_exit()	pthread_exit(NULL)
+#define	thread_join(t)	pthread_join((pthread_t)(t), NULL)
+
+#define	newproc(f, a, cid, pri, ctp, pid)	(ENOSYS)
 
 /* in libzpool, p0 exists only to have its address taken */
 typedef struct proc {
@@ -199,90 +234,55 @@ typedef struct proc {
 extern struct proc p0;
 #define	curproc		(&p0)
 
-typedef void (*thread_func_t)(void *);
-typedef void (*thread_func_arg_t)(void *);
-typedef pthread_t kt_did_t;
-
-typedef struct kthread {
-	kt_did_t	t_tid;
-	thread_func_t	t_func;
-	void *		t_arg;
-} kthread_t;
-
-#define	tsd_get(key)			pthread_getspecific(key)
-#define	tsd_set(key, val)		pthread_setspecific(key, val)
-#define	curthread			zk_thread_current()
-#define	thread_exit			zk_thread_exit
-#define	thread_create(stk, stksize, func, arg, len, pp, state, pri)	\
-	zk_thread_create(stk, stksize, (thread_func_t)func, arg,	\
-			 len, NULL, state, pri, PTHREAD_CREATE_DETACHED)
-#define	thread_join(t)			zk_thread_join(t)
-#define	newproc(f,a,cid,pri,ctp,pid)	(ENOSYS)
-
-extern kthread_t *zk_thread_current(void);
-extern void zk_thread_exit(void);
-extern kthread_t *zk_thread_create(caddr_t stk, size_t  stksize,
-	thread_func_t func, void *arg, size_t len,
-	proc_t *pp, int state, pri_t pri, int detachstate);
-extern void zk_thread_join(kt_did_t tid);
-
-#define	kpreempt_disable()	((void)0)
-#define	kpreempt_enable()	((void)0)
-
 #define	PS_NONE		-1
+
+extern kthread_t *zk_thread_create(void (*func)(void *), void *arg,
+    size_t stksize, int state);
 
 #define	issig(why)	(FALSE)
 #define	ISSIG(thr, why)	(FALSE)
 
+#define	kpreempt_disable()	((void)0)
+#define	kpreempt_enable()	((void)0)
+
 /*
  * Mutexes
  */
-#define	MTX_MAGIC	0x9522f51362a6e326ull
-#define	MTX_INIT	((void *)NULL)
-#define	MTX_DEST	((void *)-1UL)
-
 typedef struct kmutex {
-	void		*m_owner;
-	uint64_t	m_magic;
-	pthread_mutex_t	m_lock;
+	pthread_mutex_t		m_lock;
+	pthread_t		m_owner;
 } kmutex_t;
 
-#define	MUTEX_DEFAULT	0
-#define MUTEX_HELD(m)	((m)->m_owner == curthread)
-#define	MUTEX_NOT_HELD(m) (!MUTEX_HELD(m))
+#define	MUTEX_DEFAULT		0
+#define	MUTEX_NOLOCKDEP		MUTEX_DEFAULT
+#define	MUTEX_HELD(mp)		pthread_equal((mp)->m_owner, pthread_self())
+#define	MUTEX_NOT_HELD(mp)	!MUTEX_HELD(mp)
 
 extern void mutex_init(kmutex_t *mp, char *name, int type, void *cookie);
 extern void mutex_destroy(kmutex_t *mp);
 extern void mutex_enter(kmutex_t *mp);
 extern void mutex_exit(kmutex_t *mp);
 extern int mutex_tryenter(kmutex_t *mp);
-extern void *mutex_owner(kmutex_t *mp);
-extern int mutex_held(kmutex_t *mp);
 
 /*
  * RW locks
  */
-#define	RW_MAGIC	0x4d31fb123648e78aull
-#define	RW_INIT		((void *)NULL)
-#define	RW_DEST		((void *)-1UL)
-
 typedef struct krwlock {
-	void			*rw_owner;
-	void			*rw_wr_owner;
-	uint64_t		rw_magic;
 	pthread_rwlock_t	rw_lock;
+	pthread_t		rw_owner;
 	uint_t			rw_readers;
 } krwlock_t;
 
 typedef int krw_t;
 
-#define	RW_READER	0
-#define	RW_WRITER	1
-#define RW_DEFAULT	RW_READER
+#define	RW_READER		0
+#define	RW_WRITER		1
+#define	RW_DEFAULT		RW_READER
+#define	RW_NOLOCKDEP		RW_READER
 
-#define	RW_READ_HELD(x)		((x)->rw_readers > 0)
-#define	RW_WRITE_HELD(x)	((x)->rw_wr_owner == curthread)
-#define	RW_LOCK_HELD(x)		(RW_READ_HELD(x) || RW_WRITE_HELD(x))
+#define	RW_READ_HELD(rw)	((rw)->rw_readers > 0)
+#define	RW_WRITE_HELD(rw)	pthread_equal((rw)->rw_owner, pthread_self())
+#define	RW_LOCK_HELD(rw)	(RW_READ_HELD(rw) || RW_WRITE_HELD(rw))
 
 extern void rw_init(krwlock_t *rwlp, char *name, int type, void *arg);
 extern void rw_destroy(krwlock_t *rwlp);
@@ -292,7 +292,11 @@ extern int rw_tryupgrade(krwlock_t *rwlp);
 extern void rw_exit(krwlock_t *rwlp);
 #define	rw_downgrade(rwlp) do { } while (0)
 
+/*
+ * Credentials
+ */
 extern uid_t crgetuid(cred_t *cr);
+extern uid_t crgetruid(cred_t *cr);
 extern gid_t crgetgid(cred_t *cr);
 extern int crgetngroups(cred_t *cr);
 extern gid_t *crgetgroups(cred_t *cr);
@@ -300,32 +304,61 @@ extern gid_t *crgetgroups(cred_t *cr);
 /*
  * Condition variables
  */
-#define CV_MAGIC	0xd31ea9a83b1b30c4ull
+typedef pthread_cond_t		kcondvar_t;
 
-typedef struct kcondvar {
-	uint64_t		cv_magic;
-	pthread_cond_t		cv;
-} kcondvar_t;
-
-#define	CV_DEFAULT	0
+#define	CV_DEFAULT		0
+#define	CALLOUT_FLAG_ABSOLUTE	0x2
 
 extern void cv_init(kcondvar_t *cv, char *name, int type, void *arg);
 extern void cv_destroy(kcondvar_t *cv);
 extern void cv_wait(kcondvar_t *cv, kmutex_t *mp);
 extern clock_t cv_timedwait(kcondvar_t *cv, kmutex_t *mp, clock_t abstime);
+extern clock_t cv_timedwait_hires(kcondvar_t *cvp, kmutex_t *mp, hrtime_t tim,
+    hrtime_t res, int flag);
 extern void cv_signal(kcondvar_t *cv);
 extern void cv_broadcast(kcondvar_t *cv);
-#define cv_timedwait_interruptible(cv, mp, at)	cv_timedwait(cv, mp, at)
-#define cv_wait_interruptible(cv, mp)		cv_wait(cv, mp)
-#define cv_wait_io(cv, mp)			cv_wait(cv, mp)
+
+#define	cv_timedwait_io(cv, mp, at)		cv_timedwait(cv, mp, at)
+#define	cv_timedwait_sig(cv, mp, at)		cv_timedwait(cv, mp, at)
+#define	cv_wait_sig(cv, mp)			cv_wait(cv, mp)
+#define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
+#define	cv_timedwait_sig_hires(cv, mp, t, r, f) \
+	cv_timedwait_hires(cv, mp, t, r, f)
+
+/*
+ * Thread-specific data
+ */
+#define	tsd_get(k) pthread_getspecific(k)
+#define	tsd_set(k, v) pthread_setspecific(k, v)
+#define	tsd_create(kp, d) pthread_key_create(kp, d)
+#define	tsd_destroy(kp) /* nothing */
+
+/*
+ * Thread-specific data
+ */
+#define	tsd_get(k) pthread_getspecific(k)
+#define	tsd_set(k, v) pthread_setspecific(k, v)
+#define	tsd_create(kp, d) pthread_key_create(kp, d)
+#define	tsd_destroy(kp) /* nothing */
 
 /*
  * kstat creation, installation and deletion
  */
-extern kstat_t *kstat_create(char *, int,
-    char *, char *, uchar_t, ulong_t, uchar_t);
+extern kstat_t *kstat_create(const char *, int,
+    const char *, const char *, uchar_t, ulong_t, uchar_t);
+extern void kstat_named_init(kstat_named_t *, const char *, uchar_t);
 extern void kstat_install(kstat_t *);
 extern void kstat_delete(kstat_t *);
+extern void kstat_waitq_enter(kstat_io_t *);
+extern void kstat_waitq_exit(kstat_io_t *);
+extern void kstat_runq_enter(kstat_io_t *);
+extern void kstat_runq_exit(kstat_io_t *);
+extern void kstat_waitq_to_runq(kstat_io_t *);
+extern void kstat_runq_back_to_waitq(kstat_io_t *);
+extern void kstat_set_raw_ops(kstat_t *ksp,
+    int (*headers)(char *buf, size_t size),
+    int (*data)(char *buf, size_t size, void *data),
+    void *(*addr)(kstat_t *ksp, loff_t index));
 
 /*
  * Kernel memory
@@ -333,7 +366,7 @@ extern void kstat_delete(kstat_t *);
 #define	KM_SLEEP		UMEM_NOFAIL
 #define	KM_PUSHPAGE		KM_SLEEP
 #define	KM_NOSLEEP		UMEM_DEFAULT
-#define	KM_NODEBUG		0x0
+#define	KM_NORMALPRI		0	/* not needed with UMEM_DEFAULT */
 #define	KMC_NODEBUG		UMC_NODEBUG
 #define	KMC_KMEM		0x0
 #define	KMC_VMEM		0x0
@@ -349,10 +382,13 @@ extern void kstat_delete(kstat_t *);
 #define	kmem_cache_alloc(_c, _f) umem_cache_alloc(_c, _f)
 #define	kmem_cache_free(_c, _b)	umem_cache_free(_c, _b)
 #define	kmem_debugging()	0
-#define	kmem_cache_reap_now(_c)		/* nothing */
+#define	kmem_cache_reap_now(_c)	umem_cache_reap_now(_c);
 #define	kmem_cache_set_move(_c, _cb)	/* nothing */
+#define	vmem_qcache_reap(_v)		/* nothing */
 #define	POINTER_INVALIDATE(_pp)		/* nothing */
 #define	POINTER_IS_VALID(_p)	0
+
+extern vmem_t *zio_arena;
 
 typedef umem_cache_t kmem_cache_t;
 
@@ -367,7 +403,9 @@ typedef enum kmem_cbrc {
 /*
  * Task queues
  */
-typedef struct taskq taskq_t;
+
+#define	TASKQ_NAMELEN	31
+
 typedef uintptr_t taskqid_t;
 typedef void (task_func_t)(void *);
 
@@ -379,6 +417,25 @@ typedef struct taskq_ent {
 	uintptr_t		tqent_flags;
 } taskq_ent_t;
 
+typedef struct taskq {
+	char		tq_name[TASKQ_NAMELEN + 1];
+	kmutex_t	tq_lock;
+	krwlock_t	tq_threadlock;
+	kcondvar_t	tq_dispatch_cv;
+	kcondvar_t	tq_wait_cv;
+	kthread_t	**tq_threadlist;
+	int		tq_flags;
+	int		tq_active;
+	int		tq_nthreads;
+	int		tq_nalloc;
+	int		tq_minalloc;
+	int		tq_maxalloc;
+	kcondvar_t	tq_maxalloc_cv;
+	int		tq_maxalloc_wait;
+	taskq_ent_t	*tq_freelist;
+	taskq_ent_t	tq_task;
+} taskq_t;
+
 #define	TQENT_FLAG_PREALLOC	0x1	/* taskq_dispatch_ent used */
 
 #define	TASKQ_PREPOPULATE	0x0001
@@ -389,11 +446,13 @@ typedef struct taskq_ent {
 
 #define	TQ_SLEEP	KM_SLEEP	/* Can block for memory */
 #define	TQ_NOSLEEP	KM_NOSLEEP	/* cannot block for memory; may fail */
-#define	TQ_PUSHPAGE	KM_PUSHPAGE	/* Cannot perform I/O */
 #define	TQ_NOQUEUE	0x02		/* Do not enqueue if can't dispatch */
 #define	TQ_FRONT	0x08		/* Queue in front */
 
+#define	TASKQID_INVALID		((taskqid_t)0)
+
 extern taskq_t *system_taskq;
+extern taskq_t *system_delay_taskq;
 
 extern taskq_t	*taskq_create(const char *, int, pri_t, int, int, uint_t);
 #define	taskq_create_proc(a, b, c, d, e, p, f) \
@@ -410,6 +469,7 @@ extern void	taskq_init_ent(taskq_ent_t *);
 extern void	taskq_destroy(taskq_t *);
 extern void	taskq_wait(taskq_t *);
 extern void	taskq_wait_id(taskq_t *, taskqid_t);
+extern void	taskq_wait_outstanding(taskq_t *, taskqid_t);
 extern int	taskq_member(taskq_t *, kthread_t *);
 extern int	taskq_cancel_id(taskq_t *, taskqid_t);
 extern void	system_taskq_init(void);
@@ -425,8 +485,10 @@ typedef struct vnode {
 	uint64_t	v_size;
 	int		v_fd;
 	char		*v_path;
+	int		v_dump_fd;
 } vnode_t;
 
+extern char *vn_dumpdir;
 #define	AV_SCANSTAMP_SZ	32		/* length of anti-virus scanstamp */
 
 typedef struct xoptattr {
@@ -526,6 +588,16 @@ extern vnode_t *rootdir;
 #define	ddi_get_lbolt64()	(gethrtime() >> 23)
 #define	hz	119	/* frequency when using gethrtime() >> 23 for lbolt */
 
+#define	ddi_time_before(a, b)		(a < b)
+#define	ddi_time_after(a, b)		ddi_time_before(b, a)
+#define	ddi_time_before_eq(a, b)	(!ddi_time_after(a, b))
+#define	ddi_time_after_eq(a, b)		ddi_time_before_eq(b, a)
+
+#define	ddi_time_before64(a, b)		(a < b)
+#define	ddi_time_after64(a, b)		ddi_time_before64(b, a)
+#define	ddi_time_before_eq64(a, b)	(!ddi_time_after64(a, b))
+#define	ddi_time_after_eq64(a, b)	ddi_time_before_eq64(b, a)
+
 extern void delay(clock_t ticks);
 
 #define	SEC_TO_TICK(sec)	((sec) * hz)
@@ -541,29 +613,43 @@ extern void delay(clock_t ticks);
 	} while (0);
 
 #define	max_ncpus	64
+#define	boot_ncpus	(sysconf(_SC_NPROCESSORS_ONLN))
 
-#define	minclsyspri	60
-#define	maxclsyspri	99
+/*
+ * Process priorities as defined by setpriority(2) and getpriority(2).
+ */
+#define	minclsyspri	19
+#define	maxclsyspri	-20
+#define	defclsyspri	0
 
-#define	CPU_SEQID	(pthread_self() & (max_ncpus - 1))
+#define	CPU_SEQID	((uintptr_t)pthread_self() & (max_ncpus - 1))
 
 #define	kcred		NULL
 #define	CRED()		NULL
 
 #define	ptob(x)		((x) * PAGESIZE)
 
-extern uint64_t physmem;
+#define	NN_DIVISOR_1000	(1U << 0)
+#define	NN_NUMBUF_SZ	(6)
 
-extern int highbit(ulong_t i);
+extern uint64_t physmem;
+extern char *random_path;
+extern char *urandom_path;
+
+extern int highbit64(uint64_t i);
+extern int lowbit64(uint64_t i);
 extern int random_get_bytes(uint8_t *ptr, size_t len);
 extern int random_get_pseudo_bytes(uint8_t *ptr, size_t len);
 
 extern void kernel_init(int);
 extern void kernel_fini(void);
+extern void random_init(void);
+extern void random_fini(void);
 
 struct spa;
-extern void nicenum(uint64_t num, char *buf);
+extern void nicenum(uint64_t num, char *buf, size_t);
 extern void show_pool_stats(struct spa *);
+extern int set_global_var(char *arg);
 
 typedef struct callb_cpr {
 	kmutex_t	*cc_lockp;
@@ -591,7 +677,7 @@ typedef struct callb_cpr {
 
 extern char *kmem_vasprintf(const char *fmt, va_list adx);
 extern char *kmem_asprintf(const char *fmt, ...);
-#define	strfree(str) kmem_free((str), strlen(str)+1)
+#define	strfree(str) kmem_free((str), strlen(str) + 1)
 
 /*
  * Hostname information
@@ -602,6 +688,9 @@ extern int ddi_strtoul(const char *str, char **nptr, int base,
 
 extern int ddi_strtoull(const char *str, char **nptr, int base,
     u_longlong_t *result);
+
+typedef struct utsname	utsname_t;
+extern utsname_t *utsname(void);
 
 /* ZFS Boot Related stuff. */
 
@@ -637,6 +726,7 @@ extern int zfs_secpolicy_snapshot_perms(const char *name, cred_t *cr);
 extern int zfs_secpolicy_rename_perms(const char *from, const char *to,
     cred_t *cr);
 extern int zfs_secpolicy_destroy_perms(const char *name, cred_t *cr);
+extern int secpolicy_zfs(const cred_t *cr);
 extern zoneid_t getzoneid(void);
 
 /* SID stuff */
@@ -653,6 +743,20 @@ void ksiddomain_rele(ksiddomain_t *);
 #define	ddi_log_sysevent(_a, _b, _c, _d, _e, _f, _g) \
 	sysevent_post_event(_c, _d, _b, "libzpool", _e, _f)
 
-#endif /* _KERNEL */
+#define	zfs_sleep_until(wakeup)						\
+	do {								\
+		hrtime_t delta = wakeup - gethrtime();			\
+		struct timespec ts;					\
+		ts.tv_sec = delta / NANOSEC;				\
+		ts.tv_nsec = delta % NANOSEC;				\
+		(void) nanosleep(&ts, NULL);				\
+	} while (0)
 
+typedef int fstrans_cookie_t;
+
+extern fstrans_cookie_t spl_fstrans_mark(void);
+extern void spl_fstrans_unmark(fstrans_cookie_t);
+extern int __spl_pf_fstrans_check(void);
+
+#endif /* _KERNEL */
 #endif	/* _SYS_ZFS_CONTEXT_H */

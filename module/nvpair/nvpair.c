@@ -21,6 +21,7 @@
 
 /*
  * Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2017 by Delphix. All rights reserved.
  */
 
 #include <sys/stropts.h>
@@ -36,16 +37,15 @@
 #include <sys/varargs.h>
 #include <sys/ddi.h>
 #include <sys/sunddi.h>
+#include <sys/sysmacros.h>
 #else
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <stddef.h>
 #endif
 
-#ifndef	offsetof
-#define	offsetof(s, m)		((size_t)(&(((s *)0)->m)))
-#endif
 #define	skip_whitespace(p)	while ((*(p) == ' ') || (*(p) == '\t')) p++
 
 /*
@@ -138,6 +138,11 @@ static int nvlist_add_common(nvlist_t *nvl, const char *name, data_type_t type,
 #define	NVPAIR2I_NVP(nvp) \
 	((i_nvp_t *)((size_t)(nvp) - offsetof(i_nvp_t, nvi_nvp)))
 
+#ifdef _KERNEL
+int nvpair_max_recursion = 20;
+#else
+int nvpair_max_recursion = 100;
+#endif
 
 int
 nv_alloc_init(nv_alloc_t *nva, const nv_alloc_ops_t *nvo, /* args */ ...)
@@ -262,32 +267,30 @@ nvlist_nvflag(nvlist_t *nvl)
 	return (nvl->nvl_nvflag);
 }
 
-/*
- * nvlist_alloc - Allocate nvlist.
- */
-/*ARGSUSED1*/
-int
-nvlist_alloc(nvlist_t **nvlp, uint_t nvflag, int kmflag)
+static nv_alloc_t *
+nvlist_nv_alloc(int kmflag)
 {
-	nv_alloc_t *nva = nv_alloc_nosleep;
-
 #if defined(_KERNEL) && !defined(_BOOT)
 	switch (kmflag) {
 	case KM_SLEEP:
-		nva = nv_alloc_sleep;
-		break;
+		return (nv_alloc_sleep);
 	case KM_PUSHPAGE:
-		nva = nv_alloc_pushpage;
-		break;
-	case KM_NOSLEEP:
-		nva = nv_alloc_nosleep;
-		break;
+		return (nv_alloc_pushpage);
 	default:
-		return (EINVAL);
+		return (nv_alloc_nosleep);
 	}
-#endif
+#else
+	return (nv_alloc_nosleep);
+#endif /* _KERNEL && !_BOOT */
+}
 
-	return (nvlist_xalloc(nvlp, nvflag, nva));
+/*
+ * nvlist_alloc - Allocate nvlist.
+ */
+int
+nvlist_alloc(nvlist_t **nvlp, uint_t nvflag, int kmflag)
+{
+	return (nvlist_xalloc(nvlp, nvflag, nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -614,16 +617,10 @@ nvlist_contains_nvp(nvlist_t *nvl, nvpair_t *nvp)
 /*
  * Make a copy of nvlist
  */
-/*ARGSUSED1*/
 int
 nvlist_dup(nvlist_t *nvl, nvlist_t **nvlp, int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
-	return (nvlist_xdup(nvl, nvlp,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xdup(nvl, nvlp, nv_alloc_nosleep));
-#endif
+	return (nvlist_xdup(nvl, nvlp, nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -918,6 +915,8 @@ nvlist_add_common(nvlist_t *nvl, const char *name,
 
 	/* calculate sizes of the nvpair elements and the nvpair itself */
 	name_sz = strlen(name) + 1;
+	if (name_sz >= 1ULL << (sizeof (nvp->nvp_name_sz) * NBBY - 1))
+		return (EINVAL);
 
 	nvp_sz = NVP_SIZE_CALC(name_sz, value_sz);
 
@@ -1244,6 +1243,7 @@ nvpair_type_is_array(nvpair_t *nvp)
 	data_type_t type = NVP_TYPE(nvp);
 
 	if ((type == DATA_TYPE_BYTE_ARRAY) ||
+	    (type == DATA_TYPE_INT8_ARRAY) ||
 	    (type == DATA_TYPE_UINT8_ARRAY) ||
 	    (type == DATA_TYPE_INT16_ARRAY) ||
 	    (type == DATA_TYPE_UINT16_ARRAY) ||
@@ -1262,6 +1262,8 @@ nvpair_type_is_array(nvpair_t *nvp)
 static int
 nvpair_value_common(nvpair_t *nvp, data_type_t type, uint_t *nelem, void *data)
 {
+	int value_sz;
+
 	if (nvp == NULL || nvpair_type(nvp) != type)
 		return (EINVAL);
 
@@ -1291,8 +1293,9 @@ nvpair_value_common(nvpair_t *nvp, data_type_t type, uint_t *nelem, void *data)
 #endif
 		if (data == NULL)
 			return (EINVAL);
-		bcopy(NVP_VALUE(nvp), data,
-		    (size_t)i_get_value_size(type, NULL, 1));
+		if ((value_sz = i_get_value_size(type, NULL, 1)) < 0)
+			return (EINVAL);
+		bcopy(NVP_VALUE(nvp), data, (size_t)value_sz);
 		if (nelem != NULL)
 			*nelem = 1;
 		break;
@@ -1624,7 +1627,7 @@ nvlist_lookup_nvpair_ei_sep(nvlist_t *nvl, const char *name, const char sep,
 {
 	nvpair_t	*nvp;
 	const char	*np;
-	char		*sepp=NULL;
+	char		*sepp = NULL;
 	char		*idxp, *idxep;
 	nvlist_t	**nva;
 	long		idx = 0;
@@ -1638,6 +1641,8 @@ nvlist_lookup_nvpair_ei_sep(nvlist_t *nvl, const char *name, const char sep,
 	if ((nvl == NULL) || (name == NULL))
 		return (EINVAL);
 
+	sepp = NULL;
+	idx = 0;
 	/* step through components of name */
 	for (np = name; np && *np; np = sepp) {
 		/* ensure unique names */
@@ -2025,12 +2030,13 @@ typedef struct {
 	const nvs_ops_t	*nvs_ops;
 	void		*nvs_private;
 	nvpriv_t	*nvs_priv;
+	int		nvs_recursion;
 } nvstream_t;
 
 /*
  * nvs operations are:
  *   - nvs_nvlist
- *     encoding / decoding of a nvlist header (nvlist_t)
+ *     encoding / decoding of an nvlist header (nvlist_t)
  *     calculates the size used for header and end detection
  *
  *   - nvs_nvpair
@@ -2176,9 +2182,16 @@ static int
 nvs_embedded(nvstream_t *nvs, nvlist_t *embedded)
 {
 	switch (nvs->nvs_op) {
-	case NVS_OP_ENCODE:
-		return (nvs_operation(nvs, embedded, NULL));
+	case NVS_OP_ENCODE: {
+		int err;
 
+		if (nvs->nvs_recursion >= nvpair_max_recursion)
+			return (EINVAL);
+		nvs->nvs_recursion++;
+		err = nvs_operation(nvs, embedded, NULL);
+		nvs->nvs_recursion--;
+		return (err);
+	}
 	case NVS_OP_DECODE: {
 		nvpriv_t *priv;
 		int err;
@@ -2191,8 +2204,14 @@ nvs_embedded(nvstream_t *nvs, nvlist_t *embedded)
 
 		nvlist_init(embedded, embedded->nvl_nvflag, priv);
 
+		if (nvs->nvs_recursion >= nvpair_max_recursion) {
+			nvlist_free(embedded);
+			return (EINVAL);
+		}
+		nvs->nvs_recursion++;
 		if ((err = nvs_operation(nvs, embedded, NULL)) != 0)
 			nvlist_free(embedded);
+		nvs->nvs_recursion--;
 		return (err);
 	}
 	default:
@@ -2280,6 +2299,7 @@ nvlist_common(nvlist_t *nvl, char *buf, size_t *buflen, int encoding,
 		return (EINVAL);
 
 	nvs.nvs_op = nvs_op;
+	nvs.nvs_recursion = 0;
 
 	/*
 	 * For NVS_OP_ENCODE and NVS_OP_DECODE make sure an nvlist and
@@ -2352,17 +2372,12 @@ nvlist_size(nvlist_t *nvl, size_t *size, int encoding)
 /*
  * Pack nvlist into contiguous memory
  */
-/*ARGSUSED1*/
 int
 nvlist_pack(nvlist_t *nvl, char **bufp, size_t *buflen, int encoding,
     int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
 	return (nvlist_xpack(nvl, bufp, buflen, encoding,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xpack(nvl, bufp, buflen, encoding, nv_alloc_nosleep));
-#endif
+	    nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -2386,7 +2401,7 @@ nvlist_xpack(nvlist_t *nvl, char **bufp, size_t *buflen, int encoding,
 	 * 1. The nvlist has fixed allocator properties.
 	 *    All other nvlist routines (like nvlist_add_*, ...) use
 	 *    these properties.
-	 * 2. When using nvlist_pack() the user can specify his own
+	 * 2. When using nvlist_pack() the user can specify their own
 	 *    allocator properties (e.g. by using KM_NOSLEEP).
 	 *
 	 * We use the user specified properties (2). A clearer solution
@@ -2415,16 +2430,10 @@ nvlist_xpack(nvlist_t *nvl, char **bufp, size_t *buflen, int encoding,
 /*
  * Unpack buf into an nvlist_t
  */
-/*ARGSUSED1*/
 int
 nvlist_unpack(char *buf, size_t buflen, nvlist_t **nvlp, int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
-	return (nvlist_xunpack(buf, buflen, nvlp,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xunpack(buf, buflen, nvlp, nv_alloc_nosleep));
-#endif
+	return (nvlist_xunpack(buf, buflen, nvlp, nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -2599,7 +2608,8 @@ nvpair_native_embedded(nvstream_t *nvs, nvpair_t *nvp)
 		 * structure. The address may not be aligned, so we have
 		 * to use bzero.
 		 */
-		bzero(&packed->nvl_priv, sizeof (packed->nvl_priv));
+		bzero((char *)packed + offsetof(nvlist_t, nvl_priv),
+		    sizeof (uint64_t));
 	}
 
 	return (nvs_embedded(nvs, EMBEDDED_NVL(nvp)));
@@ -2627,7 +2637,8 @@ nvpair_native_embedded_array(nvstream_t *nvs, nvpair_t *nvp)
 			 * packed structure. The address may not be aligned,
 			 * so we have to use bzero.
 			 */
-			bzero(&packed->nvl_priv, sizeof (packed->nvl_priv));
+			bzero((char *)packed + offsetof(nvlist_t, nvl_priv),
+			    sizeof (uint64_t));
 	}
 
 	return (nvs_embedded_nvl_array(nvs, nvp, NULL));
@@ -2796,11 +2807,11 @@ nvs_native_nvpair(nvstream_t *nvs, nvpair_t *nvp, size_t *size)
 }
 
 static const nvs_ops_t nvs_native_ops = {
-	nvs_native_nvlist,
-	nvs_native_nvpair,
-	nvs_native_nvp_op,
-	nvs_native_nvp_size,
-	nvs_native_nvl_fini
+	.nvs_nvlist = nvs_native_nvlist,
+	.nvs_nvpair = nvs_native_nvpair,
+	.nvs_nvp_op = nvs_native_nvp_op,
+	.nvs_nvp_size = nvs_native_nvp_size,
+	.nvs_nvl_fini = nvs_native_nvl_fini
 };
 
 static int
@@ -3283,11 +3294,11 @@ nvs_xdr_nvpair(nvstream_t *nvs, nvpair_t *nvp, size_t *size)
 }
 
 static const struct nvs_ops nvs_xdr_ops = {
-	nvs_xdr_nvlist,
-	nvs_xdr_nvpair,
-	nvs_xdr_nvp_op,
-	nvs_xdr_nvp_size,
-	nvs_xdr_nvl_fini
+	.nvs_nvlist = nvs_xdr_nvlist,
+	.nvs_nvpair = nvs_xdr_nvpair,
+	.nvs_nvp_op = nvs_xdr_nvp_op,
+	.nvs_nvp_size = nvs_xdr_nvp_size,
+	.nvs_nvl_fini = nvs_xdr_nvl_fini
 };
 
 static int
@@ -3310,16 +3321,24 @@ nvs_xdr(nvstream_t *nvs, nvlist_t *nvl, char *buf, size_t *buflen)
 }
 
 #if defined(_KERNEL) && defined(HAVE_SPL)
+static int __init
+nvpair_init(void)
+{
+	return (0);
+}
 
-static int nvpair_init(void) { return 0; }
-static int nvpair_fini(void) { return 0; }
+static void __exit
+nvpair_fini(void)
+{
+}
 
-spl_module_init(nvpair_init);
-spl_module_exit(nvpair_fini);
+module_init(nvpair_init);
+module_exit(nvpair_fini);
 
 MODULE_DESCRIPTION("Generic name/value pair implementation");
 MODULE_AUTHOR(ZFS_META_AUTHOR);
 MODULE_LICENSE(ZFS_META_LICENSE);
+MODULE_VERSION(ZFS_META_VERSION "-" ZFS_META_RELEASE);
 
 EXPORT_SYMBOL(nv_alloc_init);
 EXPORT_SYMBOL(nv_alloc_reset);

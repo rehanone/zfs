@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  */
 
 /*
@@ -143,8 +143,10 @@
 #include <sys/vdev_impl.h>
 #include <sys/uberblock_impl.h>
 #include <sys/metaslab.h>
+#include <sys/metaslab_impl.h>
 #include <sys/zio.h>
 #include <sys/dsl_scan.h>
+#include <sys/abd.h>
 #include <sys/fs/zfs.h>
 
 /*
@@ -178,11 +180,12 @@ vdev_label_number(uint64_t psize, uint64_t offset)
 }
 
 static void
-vdev_label_read(zio_t *zio, vdev_t *vd, int l, void *buf, uint64_t offset,
-	uint64_t size, zio_done_func_t *done, void *private, int flags)
+vdev_label_read(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t offset,
+    uint64_t size, zio_done_func_t *done, void *private, int flags)
 {
-	ASSERT(spa_config_held(zio->io_spa, SCL_STATE_ALL, RW_WRITER) ==
-	    SCL_STATE_ALL);
+	ASSERT(
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_READER) == SCL_STATE ||
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_WRITER) == SCL_STATE);
 	ASSERT(flags & ZIO_FLAG_CONFIG_WRITER);
 
 	zio_nowait(zio_read_phys(zio, vd,
@@ -191,20 +194,162 @@ vdev_label_read(zio_t *zio, vdev_t *vd, int l, void *buf, uint64_t offset,
 	    ZIO_PRIORITY_SYNC_READ, flags, B_TRUE));
 }
 
-static void
-vdev_label_write(zio_t *zio, vdev_t *vd, int l, void *buf, uint64_t offset,
-	uint64_t size, zio_done_func_t *done, void *private, int flags)
+void
+vdev_label_write(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t offset,
+    uint64_t size, zio_done_func_t *done, void *private, int flags)
 {
-	ASSERT(spa_config_held(zio->io_spa, SCL_ALL, RW_WRITER) == SCL_ALL ||
-	    (spa_config_held(zio->io_spa, SCL_CONFIG | SCL_STATE, RW_READER) ==
-	    (SCL_CONFIG | SCL_STATE) &&
-	    dsl_pool_sync_context(spa_get_dsl(zio->io_spa))));
+	ASSERT(
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_READER) == SCL_STATE ||
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_WRITER) == SCL_STATE);
 	ASSERT(flags & ZIO_FLAG_CONFIG_WRITER);
 
 	zio_nowait(zio_write_phys(zio, vd,
 	    vdev_label_offset(vd->vdev_psize, l, offset),
 	    size, buf, ZIO_CHECKSUM_LABEL, done, private,
 	    ZIO_PRIORITY_SYNC_WRITE, flags, B_TRUE));
+}
+
+/*
+ * Generate the nvlist representing this vdev's stats
+ */
+void
+vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv)
+{
+	nvlist_t *nvx;
+	vdev_stat_t *vs;
+	vdev_stat_ex_t *vsx;
+
+	vs = kmem_alloc(sizeof (*vs), KM_SLEEP);
+	vsx = kmem_alloc(sizeof (*vsx), KM_SLEEP);
+
+	vdev_get_stats_ex(vd, vs, vsx);
+	fnvlist_add_uint64_array(nv, ZPOOL_CONFIG_VDEV_STATS,
+	    (uint64_t *)vs, sizeof (*vs) / sizeof (uint64_t));
+
+	kmem_free(vs, sizeof (*vs));
+
+	/*
+	 * Add extended stats into a special extended stats nvlist.  This keeps
+	 * all the extended stats nicely grouped together.  The extended stats
+	 * nvlist is then added to the main nvlist.
+	 */
+	nvx = fnvlist_alloc();
+
+	/* ZIOs in flight to disk */
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SYNC_R_ACTIVE_QUEUE,
+	    vsx->vsx_active_queue[ZIO_PRIORITY_SYNC_READ]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SYNC_W_ACTIVE_QUEUE,
+	    vsx->vsx_active_queue[ZIO_PRIORITY_SYNC_WRITE]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_ASYNC_R_ACTIVE_QUEUE,
+	    vsx->vsx_active_queue[ZIO_PRIORITY_ASYNC_READ]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_ASYNC_W_ACTIVE_QUEUE,
+	    vsx->vsx_active_queue[ZIO_PRIORITY_ASYNC_WRITE]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SCRUB_ACTIVE_QUEUE,
+	    vsx->vsx_active_queue[ZIO_PRIORITY_SCRUB]);
+
+	/* ZIOs pending */
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SYNC_R_PEND_QUEUE,
+	    vsx->vsx_pend_queue[ZIO_PRIORITY_SYNC_READ]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SYNC_W_PEND_QUEUE,
+	    vsx->vsx_pend_queue[ZIO_PRIORITY_SYNC_WRITE]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_ASYNC_R_PEND_QUEUE,
+	    vsx->vsx_pend_queue[ZIO_PRIORITY_ASYNC_READ]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_ASYNC_W_PEND_QUEUE,
+	    vsx->vsx_pend_queue[ZIO_PRIORITY_ASYNC_WRITE]);
+
+	fnvlist_add_uint64(nvx, ZPOOL_CONFIG_VDEV_SCRUB_PEND_QUEUE,
+	    vsx->vsx_pend_queue[ZIO_PRIORITY_SCRUB]);
+
+	/* Histograms */
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_TOT_R_LAT_HISTO,
+	    vsx->vsx_total_histo[ZIO_TYPE_READ],
+	    ARRAY_SIZE(vsx->vsx_total_histo[ZIO_TYPE_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_TOT_W_LAT_HISTO,
+	    vsx->vsx_total_histo[ZIO_TYPE_WRITE],
+	    ARRAY_SIZE(vsx->vsx_total_histo[ZIO_TYPE_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_DISK_R_LAT_HISTO,
+	    vsx->vsx_disk_histo[ZIO_TYPE_READ],
+	    ARRAY_SIZE(vsx->vsx_disk_histo[ZIO_TYPE_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_DISK_W_LAT_HISTO,
+	    vsx->vsx_disk_histo[ZIO_TYPE_WRITE],
+	    ARRAY_SIZE(vsx->vsx_disk_histo[ZIO_TYPE_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_R_LAT_HISTO,
+	    vsx->vsx_queue_histo[ZIO_PRIORITY_SYNC_READ],
+	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_SYNC_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_W_LAT_HISTO,
+	    vsx->vsx_queue_histo[ZIO_PRIORITY_SYNC_WRITE],
+	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_SYNC_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_ASYNC_R_LAT_HISTO,
+	    vsx->vsx_queue_histo[ZIO_PRIORITY_ASYNC_READ],
+	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_ASYNC_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_ASYNC_W_LAT_HISTO,
+	    vsx->vsx_queue_histo[ZIO_PRIORITY_ASYNC_WRITE],
+	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_ASYNC_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SCRUB_LAT_HISTO,
+	    vsx->vsx_queue_histo[ZIO_PRIORITY_SCRUB],
+	    ARRAY_SIZE(vsx->vsx_queue_histo[ZIO_PRIORITY_SCRUB]));
+
+	/* Request sizes */
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_IND_R_HISTO,
+	    vsx->vsx_ind_histo[ZIO_PRIORITY_SYNC_READ],
+	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_SYNC_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_IND_W_HISTO,
+	    vsx->vsx_ind_histo[ZIO_PRIORITY_SYNC_WRITE],
+	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_SYNC_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_ASYNC_IND_R_HISTO,
+	    vsx->vsx_ind_histo[ZIO_PRIORITY_ASYNC_READ],
+	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_ASYNC_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_ASYNC_IND_W_HISTO,
+	    vsx->vsx_ind_histo[ZIO_PRIORITY_ASYNC_WRITE],
+	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_ASYNC_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_IND_SCRUB_HISTO,
+	    vsx->vsx_ind_histo[ZIO_PRIORITY_SCRUB],
+	    ARRAY_SIZE(vsx->vsx_ind_histo[ZIO_PRIORITY_SCRUB]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_AGG_R_HISTO,
+	    vsx->vsx_agg_histo[ZIO_PRIORITY_SYNC_READ],
+	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_SYNC_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_SYNC_AGG_W_HISTO,
+	    vsx->vsx_agg_histo[ZIO_PRIORITY_SYNC_WRITE],
+	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_SYNC_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_ASYNC_AGG_R_HISTO,
+	    vsx->vsx_agg_histo[ZIO_PRIORITY_ASYNC_READ],
+	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_ASYNC_READ]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_ASYNC_AGG_W_HISTO,
+	    vsx->vsx_agg_histo[ZIO_PRIORITY_ASYNC_WRITE],
+	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_ASYNC_WRITE]));
+
+	fnvlist_add_uint64_array(nvx, ZPOOL_CONFIG_VDEV_AGG_SCRUB_HISTO,
+	    vsx->vsx_agg_histo[ZIO_PRIORITY_SCRUB],
+	    ARRAY_SIZE(vsx->vsx_agg_histo[ZIO_PRIORITY_SCRUB]));
+
+	/* Add extended stats nvlist to main nvlist */
+	fnvlist_add_nvlist(nv, ZPOOL_CONFIG_VDEV_STATS_EX, nvx);
+
+	fnvlist_free(nvx);
+	kmem_free(vsx, sizeof (*vsx));
 }
 
 /*
@@ -215,31 +360,31 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
     vdev_config_flag_t flags)
 {
 	nvlist_t *nv = NULL;
+	vdev_indirect_config_t *vic = &vd->vdev_indirect_config;
 
-	VERIFY(nvlist_alloc(&nv, NV_UNIQUE_NAME, KM_PUSHPAGE) == 0);
+	nv = fnvlist_alloc();
 
-	VERIFY(nvlist_add_string(nv, ZPOOL_CONFIG_TYPE,
-	    vd->vdev_ops->vdev_op_type) == 0);
+	fnvlist_add_string(nv, ZPOOL_CONFIG_TYPE, vd->vdev_ops->vdev_op_type);
 	if (!(flags & (VDEV_CONFIG_SPARE | VDEV_CONFIG_L2CACHE)))
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_ID, vd->vdev_id)
-		    == 0);
-	VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_GUID, vd->vdev_guid) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_ID, vd->vdev_id);
+	fnvlist_add_uint64(nv, ZPOOL_CONFIG_GUID, vd->vdev_guid);
 
 	if (vd->vdev_path != NULL)
-		VERIFY(nvlist_add_string(nv, ZPOOL_CONFIG_PATH,
-		    vd->vdev_path) == 0);
+		fnvlist_add_string(nv, ZPOOL_CONFIG_PATH, vd->vdev_path);
 
 	if (vd->vdev_devid != NULL)
-		VERIFY(nvlist_add_string(nv, ZPOOL_CONFIG_DEVID,
-		    vd->vdev_devid) == 0);
+		fnvlist_add_string(nv, ZPOOL_CONFIG_DEVID, vd->vdev_devid);
 
 	if (vd->vdev_physpath != NULL)
-		VERIFY(nvlist_add_string(nv, ZPOOL_CONFIG_PHYS_PATH,
-		    vd->vdev_physpath) == 0);
+		fnvlist_add_string(nv, ZPOOL_CONFIG_PHYS_PATH,
+		    vd->vdev_physpath);
+
+	if (vd->vdev_enc_sysfs_path != NULL)
+		fnvlist_add_string(nv, ZPOOL_CONFIG_VDEV_ENC_SYSFS_PATH,
+		    vd->vdev_enc_sysfs_path);
 
 	if (vd->vdev_fru != NULL)
-		VERIFY(nvlist_add_string(nv, ZPOOL_CONFIG_FRU,
-		    vd->vdev_fru) == 0);
+		fnvlist_add_string(nv, ZPOOL_CONFIG_FRU, vd->vdev_fru);
 
 	if (vd->vdev_nparity != 0) {
 		ASSERT(strcmp(vd->vdev_ops->vdev_op_type,
@@ -260,59 +405,136 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 		 * that only support a single parity device -- older software
 		 * will just ignore it.
 		 */
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_NPARITY,
-		    vd->vdev_nparity) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_NPARITY, vd->vdev_nparity);
 	}
 
 	if (vd->vdev_wholedisk != -1ULL)
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_WHOLE_DISK,
-		    vd->vdev_wholedisk) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_WHOLE_DISK,
+		    vd->vdev_wholedisk);
 
 	if (vd->vdev_not_present)
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_NOT_PRESENT, 1) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_NOT_PRESENT, 1);
 
 	if (vd->vdev_isspare)
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_IS_SPARE, 1) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_IS_SPARE, 1);
 
 	if (!(flags & (VDEV_CONFIG_SPARE | VDEV_CONFIG_L2CACHE)) &&
 	    vd == vd->vdev_top) {
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_METASLAB_ARRAY,
-		    vd->vdev_ms_array) == 0);
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_METASLAB_SHIFT,
-		    vd->vdev_ms_shift) == 0);
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_ASHIFT,
-		    vd->vdev_ashift) == 0);
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_ASIZE,
-		    vd->vdev_asize) == 0);
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_IS_LOG,
-		    vd->vdev_islog) == 0);
-		if (vd->vdev_removing)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_REMOVING,
-			    vd->vdev_removing) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_METASLAB_ARRAY,
+		    vd->vdev_ms_array);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_METASLAB_SHIFT,
+		    vd->vdev_ms_shift);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_ASHIFT, vd->vdev_ashift);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_ASIZE,
+		    vd->vdev_asize);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_IS_LOG, vd->vdev_islog);
+		if (vd->vdev_removing) {
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_REMOVING,
+			    vd->vdev_removing);
+		}
 	}
 
-	if (vd->vdev_dtl_smo.smo_object != 0)
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_DTL,
-		    vd->vdev_dtl_smo.smo_object) == 0);
+	if (vd->vdev_dtl_sm != NULL) {
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_DTL,
+		    space_map_object(vd->vdev_dtl_sm));
+	}
+
+	if (vic->vic_mapping_object != 0) {
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_INDIRECT_OBJECT,
+		    vic->vic_mapping_object);
+	}
+
+	if (vic->vic_births_object != 0) {
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_INDIRECT_BIRTHS,
+		    vic->vic_births_object);
+	}
+
+	if (vic->vic_prev_indirect_vdev != UINT64_MAX) {
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_PREV_INDIRECT_VDEV,
+		    vic->vic_prev_indirect_vdev);
+	}
 
 	if (vd->vdev_crtxg)
-		VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_CREATE_TXG,
-		    vd->vdev_crtxg) == 0);
+		fnvlist_add_uint64(nv, ZPOOL_CONFIG_CREATE_TXG, vd->vdev_crtxg);
+
+	if (flags & VDEV_CONFIG_MOS) {
+		if (vd->vdev_leaf_zap != 0) {
+			ASSERT(vd->vdev_ops->vdev_op_leaf);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_VDEV_LEAF_ZAP,
+			    vd->vdev_leaf_zap);
+		}
+
+		if (vd->vdev_top_zap != 0) {
+			ASSERT(vd == vd->vdev_top);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_VDEV_TOP_ZAP,
+			    vd->vdev_top_zap);
+		}
+	}
 
 	if (getstats) {
-		vdev_stat_t vs;
-		pool_scan_stat_t ps;
-
-		vdev_get_stats(vd, &vs);
-		VERIFY(nvlist_add_uint64_array(nv, ZPOOL_CONFIG_VDEV_STATS,
-		    (uint64_t *)&vs, sizeof (vs) / sizeof (uint64_t)) == 0);
+		vdev_config_generate_stats(vd, nv);
 
 		/* provide either current or previous scan information */
+		pool_scan_stat_t ps;
 		if (spa_scan_get_stats(spa, &ps) == 0) {
-			VERIFY(nvlist_add_uint64_array(nv,
+			fnvlist_add_uint64_array(nv,
 			    ZPOOL_CONFIG_SCAN_STATS, (uint64_t *)&ps,
-			    sizeof (pool_scan_stat_t) / sizeof (uint64_t))
-			    == 0);
+			    sizeof (pool_scan_stat_t) / sizeof (uint64_t));
+		}
+
+		pool_removal_stat_t prs;
+		if (spa_removal_get_stats(spa, &prs) == 0) {
+			fnvlist_add_uint64_array(nv,
+			    ZPOOL_CONFIG_REMOVAL_STATS, (uint64_t *)&prs,
+			    sizeof (prs) / sizeof (uint64_t));
+		}
+
+		/*
+		 * Note: this can be called from open context
+		 * (spa_get_stats()), so we need the rwlock to prevent
+		 * the mapping from being changed by condensing.
+		 */
+		rw_enter(&vd->vdev_indirect_rwlock, RW_READER);
+		if (vd->vdev_indirect_mapping != NULL) {
+			ASSERT(vd->vdev_indirect_births != NULL);
+			vdev_indirect_mapping_t *vim =
+			    vd->vdev_indirect_mapping;
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_INDIRECT_SIZE,
+			    vdev_indirect_mapping_size(vim));
+		}
+		rw_exit(&vd->vdev_indirect_rwlock);
+		if (vd->vdev_mg != NULL &&
+		    vd->vdev_mg->mg_fragmentation != ZFS_FRAG_INVALID) {
+			/*
+			 * Compute approximately how much memory would be used
+			 * for the indirect mapping if this device were to
+			 * be removed.
+			 *
+			 * Note: If the frag metric is invalid, then not
+			 * enough metaslabs have been converted to have
+			 * histograms.
+			 */
+			uint64_t seg_count = 0;
+
+			/*
+			 * There are the same number of allocated segments
+			 * as free segments, so we will have at least one
+			 * entry per free segment.
+			 */
+			for (int i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++) {
+				seg_count += vd->vdev_mg->mg_histogram[i];
+			}
+
+			/*
+			 * The maximum length of a mapping is SPA_MAXBLOCKSIZE,
+			 * so we need at least one entry per SPA_MAXBLOCKSIZE
+			 * of allocated data.
+			 */
+			seg_count += vd->vdev_stat.vs_alloc / SPA_MAXBLOCKSIZE;
+
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_INDIRECT_SIZE,
+			    seg_count *
+			    sizeof (vdev_indirect_mapping_entry_phys_t));
 		}
 	}
 
@@ -323,7 +545,7 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 		ASSERT(!vd->vdev_ishole);
 
 		child = kmem_alloc(vd->vdev_children * sizeof (nvlist_t *),
-		    KM_PUSHPAGE);
+		    KM_SLEEP);
 
 		for (c = 0, idx = 0; c < vd->vdev_children; c++) {
 			vdev_t *cvd = vd->vdev_child[c];
@@ -342,8 +564,8 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 		}
 
 		if (idx) {
-			VERIFY(nvlist_add_nvlist_array(nv,
-			    ZPOOL_CONFIG_CHILDREN, child, idx) == 0);
+			fnvlist_add_nvlist_array(nv, ZPOOL_CONFIG_CHILDREN,
+			    child, idx);
 		}
 
 		for (c = 0; c < idx; c++)
@@ -355,27 +577,22 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 		const char *aux = NULL;
 
 		if (vd->vdev_offline && !vd->vdev_tmpoffline)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_OFFLINE,
-			    B_TRUE) == 0);
-		if (vd->vdev_resilvering)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_RESILVERING,
-			    B_TRUE) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_OFFLINE, B_TRUE);
+		if (vd->vdev_resilver_txg != 0)
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_RESILVER_TXG,
+			    vd->vdev_resilver_txg);
 		if (vd->vdev_faulted)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_FAULTED,
-			    B_TRUE) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_FAULTED, B_TRUE);
 		if (vd->vdev_degraded)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_DEGRADED,
-			    B_TRUE) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_DEGRADED, B_TRUE);
 		if (vd->vdev_removed)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_REMOVED,
-			    B_TRUE) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_REMOVED, B_TRUE);
 		if (vd->vdev_unspare)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_UNSPARE,
-			    B_TRUE) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_UNSPARE, B_TRUE);
 		if (vd->vdev_ishole)
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_IS_HOLE,
-			    B_TRUE) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_IS_HOLE, B_TRUE);
 
+		/* Set the reason why we're FAULTED/DEGRADED. */
 		switch (vd->vdev_stat.vs_aux) {
 		case VDEV_AUX_ERR_EXCEEDED:
 			aux = "err_exceeded";
@@ -386,13 +603,19 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 			break;
 		}
 
-		if (aux != NULL)
-			VERIFY(nvlist_add_string(nv, ZPOOL_CONFIG_AUX_STATE,
-			    aux) == 0);
+		if (aux != NULL && !vd->vdev_tmpoffline) {
+			fnvlist_add_string(nv, ZPOOL_CONFIG_AUX_STATE, aux);
+		} else {
+			/*
+			 * We're healthy - clear any previous AUX_STATE values.
+			 */
+			if (nvlist_exists(nv, ZPOOL_CONFIG_AUX_STATE))
+				nvlist_remove_all(nv, ZPOOL_CONFIG_AUX_STATE);
+		}
 
 		if (vd->vdev_splitting && vd->vdev_orig_guid != 0LL) {
-			VERIFY(nvlist_add_uint64(nv, ZPOOL_CONFIG_ORIG_GUID,
-			    vd->vdev_orig_guid) == 0);
+			fnvlist_add_uint64(nv, ZPOOL_CONFIG_ORIG_GUID,
+			    vd->vdev_orig_guid);
 		}
 	}
 
@@ -412,13 +635,14 @@ vdev_top_config_generate(spa_t *spa, nvlist_t *config)
 	uint64_t *array;
 	uint_t c, idx;
 
-	array = kmem_alloc(rvd->vdev_children * sizeof (uint64_t), KM_PUSHPAGE);
+	array = kmem_alloc(rvd->vdev_children * sizeof (uint64_t), KM_SLEEP);
 
 	for (c = 0, idx = 0; c < rvd->vdev_children; c++) {
 		vdev_t *tvd = rvd->vdev_child[c];
 
-		if (tvd->vdev_ishole)
+		if (tvd->vdev_ishole) {
 			array[idx++] = c;
+		}
 	}
 
 	if (idx) {
@@ -446,27 +670,28 @@ vdev_label_read_config(vdev_t *vd, uint64_t txg)
 	spa_t *spa = vd->vdev_spa;
 	nvlist_t *config = NULL;
 	vdev_phys_t *vp;
+	abd_t *vp_abd;
 	zio_t *zio;
 	uint64_t best_txg = 0;
 	int error = 0;
 	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL |
 	    ZIO_FLAG_SPECULATIVE;
-	int l;
 
 	ASSERT(spa_config_held(spa, SCL_STATE_ALL, RW_WRITER) == SCL_STATE_ALL);
 
 	if (!vdev_readable(vd))
 		return (NULL);
 
-	vp = zio_buf_alloc(sizeof (vdev_phys_t));
+	vp_abd = abd_alloc_linear(sizeof (vdev_phys_t), B_TRUE);
+	vp = abd_to_buf(vp_abd);
 
 retry:
-	for (l = 0; l < VDEV_LABELS; l++) {
+	for (int l = 0; l < VDEV_LABELS; l++) {
 		nvlist_t *label = NULL;
 
 		zio = zio_root(spa, NULL, NULL, flags);
 
-		vdev_label_read(zio, vd, l, vp,
+		vdev_label_read(zio, vd, l, vp_abd,
 		    offsetof(vdev_label_t, vl_vdev_phys),
 		    sizeof (vdev_phys_t), NULL, NULL, flags);
 
@@ -505,7 +730,7 @@ retry:
 		goto retry;
 	}
 
-	zio_buf_free(vp, sizeof (vdev_phys_t));
+	abd_free(vp_abd);
 
 	return (config);
 }
@@ -615,7 +840,8 @@ vdev_inuse(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason,
 	 * read-only.  Instead we look to see if the pools is marked
 	 * read-only in the namespace and set the state to active.
 	 */
-	if ((spa = spa_by_guid(pool_guid, device_guid)) != NULL &&
+	if (state != POOL_STATE_SPARE && state != POOL_STATE_L2CACHE &&
+	    (spa = spa_by_guid(pool_guid, device_guid)) != NULL &&
 	    spa_mode(spa) == FREAD)
 		state = POOL_STATE_ACTIVE;
 
@@ -640,20 +866,20 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	spa_t *spa = vd->vdev_spa;
 	nvlist_t *label;
 	vdev_phys_t *vp;
-	char *pad2;
+	abd_t *vp_abd;
+	abd_t *pad2;
 	uberblock_t *ub;
+	abd_t *ub_abd;
 	zio_t *zio;
 	char *buf;
 	size_t buflen;
 	int error;
 	uint64_t spare_guid = 0, l2cache_guid = 0;
 	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL;
-	int c, l;
-	vdev_t *pvd;
 
 	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
 
-	for (c = 0; c < vd->vdev_children; c++)
+	for (int c = 0; c < vd->vdev_children; c++)
 		if ((error = vdev_label_init(vd->vdev_child[c],
 		    crtxg, reason)) != 0)
 			return (error);
@@ -661,21 +887,21 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	/* Track the creation time for this vdev */
 	vd->vdev_crtxg = crtxg;
 
-	if (!vd->vdev_ops->vdev_op_leaf)
+	if (!vd->vdev_ops->vdev_op_leaf || !spa_writeable(spa))
 		return (0);
 
 	/*
 	 * Dead vdevs cannot be initialized.
 	 */
 	if (vdev_is_dead(vd))
-		return (EIO);
+		return (SET_ERROR(EIO));
 
 	/*
 	 * Determine if the vdev is in use.
 	 */
 	if (reason != VDEV_LABEL_REMOVE && reason != VDEV_LABEL_SPLIT &&
 	    vdev_inuse(vd, crtxg, reason, &spare_guid, &l2cache_guid))
-		return (EBUSY);
+		return (SET_ERROR(EBUSY));
 
 	/*
 	 * If this is a request to add or replace a spare or l2cache device
@@ -689,7 +915,7 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 
 		vd->vdev_guid += guid_delta;
 
-		for (pvd = vd; pvd != NULL; pvd = pvd->vdev_parent)
+		for (vdev_t *pvd = vd; pvd != NULL; pvd = pvd->vdev_parent)
 			pvd->vdev_guid_sum += guid_delta;
 
 		/*
@@ -709,7 +935,7 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 
 		vd->vdev_guid += guid_delta;
 
-		for (pvd = vd; pvd != NULL; pvd = pvd->vdev_parent)
+		for (vdev_t *pvd = vd; pvd != NULL; pvd = pvd->vdev_parent)
 			pvd->vdev_guid_sum += guid_delta;
 
 		/*
@@ -725,8 +951,9 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	/*
 	 * Initialize its label.
 	 */
-	vp = zio_buf_alloc(sizeof (vdev_phys_t));
-	bzero(vp, sizeof (vdev_phys_t));
+	vp_abd = abd_alloc_linear(sizeof (vdev_phys_t), B_TRUE);
+	abd_zero(vp_abd, sizeof (vdev_phys_t));
+	vp = abd_to_buf(vp_abd);
 
 	/*
 	 * Generate a label describing the pool and our top-level vdev.
@@ -743,7 +970,7 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 		 * active hot spare (in which case we want to revert the
 		 * labels).
 		 */
-		VERIFY(nvlist_alloc(&label, NV_UNIQUE_NAME, KM_PUSHPAGE) == 0);
+		VERIFY(nvlist_alloc(&label, NV_UNIQUE_NAME, KM_SLEEP) == 0);
 
 		VERIFY(nvlist_add_uint64(label, ZPOOL_CONFIG_VERSION,
 		    spa_version(spa)) == 0);
@@ -756,7 +983,7 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 		/*
 		 * For level 2 ARC devices, add a special label.
 		 */
-		VERIFY(nvlist_alloc(&label, NV_UNIQUE_NAME, KM_PUSHPAGE) == 0);
+		VERIFY(nvlist_alloc(&label, NV_UNIQUE_NAME, KM_SLEEP) == 0);
 
 		VERIFY(nvlist_add_uint64(label, ZPOOL_CONFIG_VERSION,
 		    spa_version(spa)) == 0);
@@ -783,25 +1010,26 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	buf = vp->vp_nvlist;
 	buflen = sizeof (vp->vp_nvlist);
 
-	error = nvlist_pack(label, &buf, &buflen, NV_ENCODE_XDR, KM_PUSHPAGE);
+	error = nvlist_pack(label, &buf, &buflen, NV_ENCODE_XDR, KM_SLEEP);
 	if (error != 0) {
 		nvlist_free(label);
-		zio_buf_free(vp, sizeof (vdev_phys_t));
+		abd_free(vp_abd);
 		/* EFAULT means nvlist_pack ran out of room */
-		return (error == EFAULT ? ENAMETOOLONG : EINVAL);
+		return (SET_ERROR(error == EFAULT ? ENAMETOOLONG : EINVAL));
 	}
 
 	/*
 	 * Initialize uberblock template.
 	 */
-	ub = zio_buf_alloc(VDEV_UBERBLOCK_RING);
-	bzero(ub, VDEV_UBERBLOCK_RING);
-	*ub = spa->spa_uberblock;
+	ub_abd = abd_alloc_linear(VDEV_UBERBLOCK_RING, B_TRUE);
+	abd_zero(ub_abd, VDEV_UBERBLOCK_RING);
+	abd_copy_from_buf(ub_abd, &spa->spa_uberblock, sizeof (uberblock_t));
+	ub = abd_to_buf(ub_abd);
 	ub->ub_txg = 0;
 
 	/* Initialize the 2nd padding area. */
-	pad2 = zio_buf_alloc(VDEV_PAD_SIZE);
-	bzero(pad2, VDEV_PAD_SIZE);
+	pad2 = abd_alloc_for_io(VDEV_PAD_SIZE, B_TRUE);
+	abd_zero(pad2, VDEV_PAD_SIZE);
 
 	/*
 	 * Write everything in parallel.
@@ -809,9 +1037,9 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 retry:
 	zio = zio_root(spa, NULL, NULL, flags);
 
-	for (l = 0; l < VDEV_LABELS; l++) {
+	for (int l = 0; l < VDEV_LABELS; l++) {
 
-		vdev_label_write(zio, vd, l, vp,
+		vdev_label_write(zio, vd, l, vp_abd,
 		    offsetof(vdev_label_t, vl_vdev_phys),
 		    sizeof (vdev_phys_t), NULL, NULL, flags);
 
@@ -824,7 +1052,7 @@ retry:
 		    offsetof(vdev_label_t, vl_pad2),
 		    VDEV_PAD_SIZE, NULL, NULL, flags);
 
-		vdev_label_write(zio, vd, l, ub,
+		vdev_label_write(zio, vd, l, ub_abd,
 		    offsetof(vdev_label_t, vl_uberblock),
 		    VDEV_UBERBLOCK_RING, NULL, NULL, flags);
 	}
@@ -837,9 +1065,9 @@ retry:
 	}
 
 	nvlist_free(label);
-	zio_buf_free(pad2, VDEV_PAD_SIZE);
-	zio_buf_free(ub, VDEV_UBERBLOCK_RING);
-	zio_buf_free(vp, sizeof (vdev_phys_t));
+	abd_free(pad2);
+	abd_free(ub_abd);
+	abd_free(vp_abd);
 
 	/*
 	 * If this vdev hasn't been previously identified as a spare, then we
@@ -877,19 +1105,13 @@ retry:
  * among uberblocks with equal txg, choose the one with the latest timestamp.
  */
 static int
-vdev_uberblock_compare(uberblock_t *ub1, uberblock_t *ub2)
+vdev_uberblock_compare(const uberblock_t *ub1, const uberblock_t *ub2)
 {
-	if (ub1->ub_txg < ub2->ub_txg)
-		return (-1);
-	if (ub1->ub_txg > ub2->ub_txg)
-		return (1);
+	int cmp = AVL_CMP(ub1->ub_txg, ub2->ub_txg);
+	if (likely(cmp))
+		return (cmp);
 
-	if (ub1->ub_timestamp < ub2->ub_timestamp)
-		return (-1);
-	if (ub1->ub_timestamp > ub2->ub_timestamp)
-		return (1);
-
-	return (0);
+	return (AVL_CMP(ub1->ub_timestamp, ub2->ub_timestamp));
 }
 
 struct ubl_cbdata {
@@ -903,7 +1125,7 @@ vdev_uberblock_load_done(zio_t *zio)
 	vdev_t *vd = zio->io_vd;
 	spa_t *spa = zio->io_spa;
 	zio_t *rio = zio->io_private;
-	uberblock_t *ub = zio->io_data;
+	uberblock_t *ub = abd_to_buf(zio->io_abd);
 	struct ubl_cbdata *cbp = rio->io_private;
 
 	ASSERT3U(zio->io_size, ==, VDEV_UBERBLOCK_SIZE(vd));
@@ -924,24 +1146,22 @@ vdev_uberblock_load_done(zio_t *zio)
 		mutex_exit(&rio->io_lock);
 	}
 
-	zio_buf_free(zio->io_data, zio->io_size);
+	abd_free(zio->io_abd);
 }
 
 static void
 vdev_uberblock_load_impl(zio_t *zio, vdev_t *vd, int flags,
     struct ubl_cbdata *cbp)
 {
-	int c, l, n;
-
-	for (c = 0; c < vd->vdev_children; c++)
+	for (int c = 0; c < vd->vdev_children; c++)
 		vdev_uberblock_load_impl(zio, vd->vdev_child[c], flags, cbp);
 
 	if (vd->vdev_ops->vdev_op_leaf && vdev_readable(vd)) {
-		for (l = 0; l < VDEV_LABELS; l++) {
-			for (n = 0; n < VDEV_UBERBLOCK_COUNT(vd); n++) {
+		for (int l = 0; l < VDEV_LABELS; l++) {
+			for (int n = 0; n < VDEV_UBERBLOCK_COUNT(vd); n++) {
 				vdev_label_read(zio, vd, l,
-				    zio_buf_alloc(VDEV_UBERBLOCK_SIZE(vd)),
-				    VDEV_UBERBLOCK_OFFSET(vd, n),
+				    abd_alloc_linear(VDEV_UBERBLOCK_SIZE(vd),
+				    B_TRUE), VDEV_UBERBLOCK_OFFSET(vd, n),
 				    VDEV_UBERBLOCK_SIZE(vd),
 				    vdev_uberblock_load_done, zio, flags);
 			}
@@ -990,6 +1210,60 @@ vdev_uberblock_load(vdev_t *rvd, uberblock_t *ub, nvlist_t **config)
 }
 
 /*
+ * For use when a leaf vdev is expanded.
+ * The location of labels 2 and 3 changed, and at the new location the
+ * uberblock rings are either empty or contain garbage.  The sync will write
+ * new configs there because the vdev is dirty, but expansion also needs the
+ * uberblock rings copied.  Read them from label 0 which did not move.
+ *
+ * Since the point is to populate labels {2,3} with valid uberblocks,
+ * we zero uberblocks we fail to read or which are not valid.
+ */
+
+static void
+vdev_copy_uberblocks(vdev_t *vd)
+{
+	abd_t *ub_abd;
+	zio_t *write_zio;
+	int locks = (SCL_L2ARC | SCL_ZIO);
+	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL |
+	    ZIO_FLAG_SPECULATIVE;
+
+	ASSERT(spa_config_held(vd->vdev_spa, SCL_STATE, RW_READER) ==
+	    SCL_STATE);
+	ASSERT(vd->vdev_ops->vdev_op_leaf);
+
+	spa_config_enter(vd->vdev_spa, locks, FTAG, RW_READER);
+
+	ub_abd = abd_alloc_linear(VDEV_UBERBLOCK_SIZE(vd), B_TRUE);
+
+	write_zio = zio_root(vd->vdev_spa, NULL, NULL, flags);
+	for (int n = 0; n < VDEV_UBERBLOCK_COUNT(vd); n++) {
+		const int src_label = 0;
+		zio_t *zio;
+
+		zio = zio_root(vd->vdev_spa, NULL, NULL, flags);
+		vdev_label_read(zio, vd, src_label, ub_abd,
+		    VDEV_UBERBLOCK_OFFSET(vd, n), VDEV_UBERBLOCK_SIZE(vd),
+		    NULL, NULL, flags);
+
+		if (zio_wait(zio) || uberblock_verify(abd_to_buf(ub_abd)))
+			abd_zero(ub_abd, VDEV_UBERBLOCK_SIZE(vd));
+
+		for (int l = 2; l < VDEV_LABELS; l++)
+			vdev_label_write(write_zio, vd, l, ub_abd,
+			    VDEV_UBERBLOCK_OFFSET(vd, n),
+			    VDEV_UBERBLOCK_SIZE(vd), NULL, NULL,
+			    flags | ZIO_FLAG_DONT_PROPAGATE);
+	}
+	(void) zio_wait(write_zio);
+
+	spa_config_exit(vd->vdev_spa, locks, FTAG);
+
+	abd_free(ub_abd);
+}
+
+/*
  * On success, increment root zio's count of good writes.
  * We only get credit for writes to known-visible vdevs; see spa_vdev_add().
  */
@@ -999,20 +1273,20 @@ vdev_uberblock_sync_done(zio_t *zio)
 	uint64_t *good_writes = zio->io_private;
 
 	if (zio->io_error == 0 && zio->io_vd->vdev_top->vdev_ms_array != 0)
-		atomic_add_64(good_writes, 1);
+		atomic_inc_64(good_writes);
 }
 
 /*
  * Write the uberblock to all labels of all leaves of the specified vdev.
  */
 static void
-vdev_uberblock_sync(zio_t *zio, uberblock_t *ub, vdev_t *vd, int flags)
+vdev_uberblock_sync(zio_t *zio, uint64_t *good_writes,
+    uberblock_t *ub, vdev_t *vd, int flags)
 {
-	uberblock_t *ubbuf;
-	int c, l, n;
-
-	for (c = 0; c < vd->vdev_children; c++)
-		vdev_uberblock_sync(zio, ub, vd->vdev_child[c], flags);
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		vdev_uberblock_sync(zio, good_writes,
+		    ub, vd->vdev_child[c], flags);
+	}
 
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return;
@@ -1020,33 +1294,42 @@ vdev_uberblock_sync(zio_t *zio, uberblock_t *ub, vdev_t *vd, int flags)
 	if (!vdev_writeable(vd))
 		return;
 
-	n = ub->ub_txg & (VDEV_UBERBLOCK_COUNT(vd) - 1);
+	/* If the vdev was expanded, need to copy uberblock rings. */
+	if (vd->vdev_state == VDEV_STATE_HEALTHY &&
+	    vd->vdev_copy_uberblocks == B_TRUE) {
+		vdev_copy_uberblocks(vd);
+		vd->vdev_copy_uberblocks = B_FALSE;
+	}
 
-	ubbuf = zio_buf_alloc(VDEV_UBERBLOCK_SIZE(vd));
-	bzero(ubbuf, VDEV_UBERBLOCK_SIZE(vd));
-	*ubbuf = *ub;
+	int m = spa_multihost(vd->vdev_spa) ? MMP_BLOCKS_PER_LABEL : 0;
+	int n = ub->ub_txg % (VDEV_UBERBLOCK_COUNT(vd) - m);
 
-	for (l = 0; l < VDEV_LABELS; l++)
-		vdev_label_write(zio, vd, l, ubbuf,
+	/* Copy the uberblock_t into the ABD */
+	abd_t *ub_abd = abd_alloc_for_io(VDEV_UBERBLOCK_SIZE(vd), B_TRUE);
+	abd_zero(ub_abd, VDEV_UBERBLOCK_SIZE(vd));
+	abd_copy_from_buf(ub_abd, ub, sizeof (uberblock_t));
+
+	for (int l = 0; l < VDEV_LABELS; l++)
+		vdev_label_write(zio, vd, l, ub_abd,
 		    VDEV_UBERBLOCK_OFFSET(vd, n), VDEV_UBERBLOCK_SIZE(vd),
-		    vdev_uberblock_sync_done, zio->io_private,
+		    vdev_uberblock_sync_done, good_writes,
 		    flags | ZIO_FLAG_DONT_PROPAGATE);
 
-	zio_buf_free(ubbuf, VDEV_UBERBLOCK_SIZE(vd));
+	abd_free(ub_abd);
 }
 
+/* Sync the uberblocks to all vdevs in svd[] */
 int
 vdev_uberblock_sync_list(vdev_t **svd, int svdcount, uberblock_t *ub, int flags)
 {
 	spa_t *spa = svd[0]->vdev_spa;
 	zio_t *zio;
 	uint64_t good_writes = 0;
-	int v;
 
-	zio = zio_root(spa, NULL, &good_writes, flags);
+	zio = zio_root(spa, NULL, NULL, flags);
 
-	for (v = 0; v < svdcount; v++)
-		vdev_uberblock_sync(zio, ub, svd[v], flags);
+	for (int v = 0; v < svdcount; v++)
+		vdev_uberblock_sync(zio, &good_writes, ub, svd[v], flags);
 
 	(void) zio_wait(zio);
 
@@ -1057,8 +1340,11 @@ vdev_uberblock_sync_list(vdev_t **svd, int svdcount, uberblock_t *ub, int flags)
 	 */
 	zio = zio_root(spa, NULL, NULL, flags);
 
-	for (v = 0; v < svdcount; v++)
-		zio_flush(zio, svd[v]);
+	for (int v = 0; v < svdcount; v++) {
+		if (vdev_writeable(svd[v])) {
+			zio_flush(zio, svd[v]);
+		}
+	}
 
 	(void) zio_wait(zio);
 
@@ -1074,7 +1360,7 @@ vdev_label_sync_done(zio_t *zio)
 	uint64_t *good_writes = zio->io_private;
 
 	if (zio->io_error == 0)
-		atomic_add_64(good_writes, 1);
+		atomic_inc_64(good_writes);
 }
 
 /*
@@ -1086,7 +1372,7 @@ vdev_label_sync_top_done(zio_t *zio)
 	uint64_t *good_writes = zio->io_private;
 
 	if (*good_writes == 0)
-		zio->io_error = EIO;
+		zio->io_error = SET_ERROR(EIO);
 
 	kmem_free(good_writes, sizeof (uint64_t));
 }
@@ -1104,16 +1390,19 @@ vdev_label_sync_ignore_done(zio_t *zio)
  * Write all even or odd labels to all leaves of the specified vdev.
  */
 static void
-vdev_label_sync(zio_t *zio, vdev_t *vd, int l, uint64_t txg, int flags)
+vdev_label_sync(zio_t *zio, uint64_t *good_writes,
+    vdev_t *vd, int l, uint64_t txg, int flags)
 {
 	nvlist_t *label;
 	vdev_phys_t *vp;
+	abd_t *vp_abd;
 	char *buf;
 	size_t buflen;
-	int c;
 
-	for (c = 0; c < vd->vdev_children; c++)
-		vdev_label_sync(zio, vd->vdev_child[c], l, txg, flags);
+	for (int c = 0; c < vd->vdev_children; c++) {
+		vdev_label_sync(zio, good_writes,
+		    vd->vdev_child[c], l, txg, flags);
+	}
 
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return;
@@ -1126,23 +1415,24 @@ vdev_label_sync(zio_t *zio, vdev_t *vd, int l, uint64_t txg, int flags)
 	 */
 	label = spa_config_generate(vd->vdev_spa, vd, txg, B_FALSE);
 
-	vp = zio_buf_alloc(sizeof (vdev_phys_t));
-	bzero(vp, sizeof (vdev_phys_t));
+	vp_abd = abd_alloc_linear(sizeof (vdev_phys_t), B_TRUE);
+	abd_zero(vp_abd, sizeof (vdev_phys_t));
+	vp = abd_to_buf(vp_abd);
 
 	buf = vp->vp_nvlist;
 	buflen = sizeof (vp->vp_nvlist);
 
-	if (nvlist_pack(label, &buf, &buflen, NV_ENCODE_XDR, KM_PUSHPAGE) == 0) {
+	if (!nvlist_pack(label, &buf, &buflen, NV_ENCODE_XDR, KM_SLEEP)) {
 		for (; l < VDEV_LABELS; l += 2) {
-			vdev_label_write(zio, vd, l, vp,
+			vdev_label_write(zio, vd, l, vp_abd,
 			    offsetof(vdev_label_t, vl_vdev_phys),
 			    sizeof (vdev_phys_t),
-			    vdev_label_sync_done, zio->io_private,
+			    vdev_label_sync_done, good_writes,
 			    flags | ZIO_FLAG_DONT_PROPAGATE);
 		}
 	}
 
-	zio_buf_free(vp, sizeof (vdev_phys_t));
+	abd_free(vp_abd);
 	nvlist_free(label);
 }
 
@@ -1161,16 +1451,15 @@ vdev_label_sync_list(spa_t *spa, int l, uint64_t txg, int flags)
 
 	for (vd = list_head(dl); vd != NULL; vd = list_next(dl, vd)) {
 		uint64_t *good_writes;
-		zio_t *vio;
 
 		ASSERT(!vd->vdev_ishole);
 
-		good_writes = kmem_zalloc(sizeof (uint64_t), KM_PUSHPAGE);
-		vio = zio_null(zio, spa, NULL,
+		good_writes = kmem_zalloc(sizeof (uint64_t), KM_SLEEP);
+		zio_t *vio = zio_null(zio, spa, NULL,
 		    (vd->vdev_islog || vd->vdev_aux != NULL) ?
 		    vdev_label_sync_ignore_done : vdev_label_sync_top_done,
 		    good_writes, flags);
-		vdev_label_sync(vio, vd, l, txg, flags);
+		vdev_label_sync(vio, good_writes, vd, l, txg, flags);
 		zio_nowait(vio);
 	}
 
@@ -1201,15 +1490,16 @@ vdev_label_sync_list(spa_t *spa, int l, uint64_t txg, int flags)
  * at any time, you can just call it again, and it will resume its work.
  */
 int
-vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg, boolean_t tryhard)
+vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg)
 {
 	spa_t *spa = svd[0]->vdev_spa;
 	uberblock_t *ub = &spa->spa_uberblock;
 	vdev_t *vd;
 	zio_t *zio;
-	int error;
+	int error = 0;
 	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL;
 
+retry:
 	/*
 	 * Normally, we don't want to try too hard to write every label and
 	 * uberblock.  If there is a flaky disk, we don't want the rest of the
@@ -1217,8 +1507,11 @@ vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg, boolean_t tryhard)
 	 * single label out, we should retry with ZIO_FLAG_TRYHARD before
 	 * bailing out and declaring the pool faulted.
 	 */
-	if (tryhard)
+	if (error != 0) {
+		if ((flags & ZIO_FLAG_TRYHARD) != 0)
+			return (error);
 		flags |= ZIO_FLAG_TRYHARD;
+	}
 
 	ASSERT(ub->ub_txg <= txg);
 
@@ -1228,10 +1521,13 @@ vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg, boolean_t tryhard)
 	 * and the vdev configuration hasn't changed,
 	 * then there's nothing to do.
 	 */
-	if (ub->ub_txg < txg &&
-	    uberblock_update(ub, spa->spa_root_vdev, txg) == B_FALSE &&
-	    list_is_empty(&spa->spa_config_dirty_list))
-		return (0);
+	if (ub->ub_txg < txg) {
+		boolean_t changed = uberblock_update(ub, spa->spa_root_vdev,
+		    txg, spa->spa_mmp.mmp_delay);
+
+		if (!changed && list_is_empty(&spa->spa_config_dirty_list))
+			return (0);
+	}
 
 	if (txg > spa_freeze_txg(spa))
 		return (0);
@@ -1262,7 +1558,7 @@ vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg, boolean_t tryhard)
 	 * are committed to stable storage before the uberblock update.
 	 */
 	if ((error = vdev_label_sync_list(spa, 0, txg, flags)) != 0)
-		return (error);
+		goto retry;
 
 	/*
 	 * Sync the uberblocks to all vdevs in svd[].
@@ -1280,7 +1576,10 @@ vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg, boolean_t tryhard)
 	 *	to the new uberblocks.
 	 */
 	if ((error = vdev_uberblock_sync_list(svd, svdcount, ub, flags)) != 0)
-		return (error);
+		goto retry;
+
+	if (spa_multihost(spa))
+		mmp_update_uberblock(spa, ub);
 
 	/*
 	 * Sync out odd labels for every dirty vdev.  If the system dies
@@ -1292,5 +1591,8 @@ vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg, boolean_t tryhard)
 	 * to disk to ensure that all odd-label updates are committed to
 	 * stable storage before the next transaction group begins.
 	 */
-	return (vdev_label_sync_list(spa, 1, txg, flags));
+	if ((error = vdev_label_sync_list(spa, 1, txg, flags)) != 0)
+		goto retry;
+
+	return (0);
 }

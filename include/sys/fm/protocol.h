@@ -50,6 +50,7 @@ extern "C" {
 #define	FM_RSRC_CLASS			"resource"
 #define	FM_LIST_EVENT			"list"
 #define	FM_IREPORT_CLASS		"ireport"
+#define	FM_SYSEVENT_CLASS		"sysevent"
 
 /* FM list.* event class values */
 #define	FM_LIST_SUSPECT_CLASS		FM_LIST_EVENT ".suspect"
@@ -70,6 +71,7 @@ extern "C" {
 #define	FM_EREPORT_DETECTOR		"detector"
 #define	FM_EREPORT_ENA			"ena"
 #define	FM_EREPORT_TIME			"time"
+#define	FM_EREPORT_EID			"eid"
 
 /* list.* event payload member names */
 #define	FM_LIST_EVENT_SIZE		"list-sz"
@@ -359,6 +361,7 @@ extern uint64_t fm_ena_generation_get(uint64_t);
 extern uchar_t fm_ena_format_get(uint64_t);
 extern uint64_t fm_ena_id_get(uint64_t);
 extern uint64_t fm_ena_time_get(uint64_t);
+extern void fm_erpt_dropped_increment(void);
 
 #ifdef	__cplusplus
 }

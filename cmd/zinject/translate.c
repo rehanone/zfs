@@ -115,8 +115,12 @@ parse_pathname(const char *inpath, char *dataset, char *relpath,
 		return (-1);
 	}
 
+#ifdef HAVE_SETMNTENT
+	if ((fp = setmntent(MNTTAB, "r")) == NULL) {
+#else
 	if ((fp = fopen(MNTTAB, "r")) == NULL) {
-		(void) fprintf(stderr, "cannot open /etc/mtab\n");
+#endif
+		(void) fprintf(stderr, "cannot open %s\n", MNTTAB);
 		return (-1);
 	}
 
@@ -175,7 +179,7 @@ object_from_path(const char *dataset, const char *path, struct stat64 *statbuf,
 	 */
 	sync();
 
-	err = dmu_objset_own(dataset, DMU_OST_ZFS, B_TRUE, FTAG, &os);
+	err = dmu_objset_own(dataset, DMU_OST_ZFS, B_TRUE, B_FALSE, FTAG, &os);
 	if (err != 0) {
 		(void) fprintf(stderr, "cannot open dataset '%s': %s\n",
 		    dataset, strerror(err));
@@ -185,7 +189,7 @@ object_from_path(const char *dataset, const char *path, struct stat64 *statbuf,
 	record->zi_objset = dmu_objset_id(os);
 	record->zi_object = statbuf->st_ino;
 
-	dmu_objset_disown(os, FTAG);
+	dmu_objset_disown(os, B_FALSE, FTAG);
 
 	return (0);
 }
@@ -263,7 +267,7 @@ calculate_range(const char *dataset, err_type_t type, int level, char *range,
 	 * size.
 	 */
 	if ((err = dmu_objset_own(dataset, DMU_OST_ANY,
-	    B_TRUE, FTAG, &os)) != 0) {
+	    B_TRUE, B_FALSE, FTAG, &os)) != 0) {
 		(void) fprintf(stderr, "cannot open dataset '%s': %s\n",
 		    dataset, strerror(err));
 		goto out;
@@ -325,7 +329,7 @@ out:
 			dnode_rele(dn, FTAG);
 	}
 	if (os)
-		dmu_objset_disown(os, FTAG);
+		dmu_objset_disown(os, B_FALSE, FTAG);
 
 	return (ret);
 }
@@ -432,7 +436,7 @@ translate_raw(const char *str, zinject_record_t *record)
 {
 	/*
 	 * A raw bookmark of the form objset:object:level:blkid, where each
-	 * number is a hexidecimal value.
+	 * number is a hexadecimal value.
 	 */
 	if (sscanf(str, "%llx:%llx:%x:%llx", (u_longlong_t *)&record->zi_objset,
 	    (u_longlong_t *)&record->zi_object, &record->zi_level,
@@ -463,13 +467,14 @@ translate_device(const char *pool, const char *device, err_type_t label_type,
 	if ((zhp = zpool_open(g_zfs, pool)) == NULL)
 		return (-1);
 
-	record->zi_guid = strtoull(device, &end, 16);
+	record->zi_guid = strtoull(device, &end, 0);
 	if (record->zi_guid == 0 || *end != '\0') {
 		tgt = zpool_find_vdev(zhp, device, &isspare, &iscache, NULL);
 
 		if (tgt == NULL) {
 			(void) fprintf(stderr, "cannot find device '%s' in "
 			    "pool '%s'\n", device, pool);
+			zpool_close(zhp);
 			return (-1);
 		}
 
@@ -511,5 +516,6 @@ translate_device(const char *pool, const char *device, err_type_t label_type,
 		record->zi_end = record->zi_start + VDEV_PAD_SIZE - 1;
 		break;
 	}
+	zpool_close(zhp);
 	return (0);
 }

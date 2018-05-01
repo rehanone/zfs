@@ -26,7 +26,7 @@
  */
 
 #ifndef _SYS_VDEV_DISK_H
-#define _SYS_VDEV_DISK_H
+#define	_SYS_VDEV_DISK_H
 
 #ifdef _KERNEL
 #include <sys/vdev.h>
@@ -36,10 +36,6 @@ typedef struct vdev_disk {
 	char			*vd_minor;
 	struct block_device	*vd_bdev;
 } vdev_disk_t;
-
-extern int vdev_disk_physio(struct block_device *, caddr_t,
-			    size_t, uint64_t, int);
-extern int vdev_disk_read_rootlabel(char *, char *, nvlist_t **);
 
 #endif /* _KERNEL */
 #endif /* _SYS_VDEV_DISK_H */
